@@ -37,13 +37,32 @@ Complex HEIF features should eventually fall back to libheif's normal CPU decode
 
 ## Build
 
-Requires CMake, a C compiler, `pkg-config`, and libheif development headers.
+Requires CMake, a C compiler, `pkg-config`, libheif development headers, and
+FFmpeg development libraries:
+
+```bash
+sudo apt install libheif-dev libavcodec-dev libavutil-dev libswscale-dev
+```
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ./build/heicprobe image.heic
 ```
+
+The focused NVDEC proof mode decodes the same disposable image first through
+the normal libheif CPU decoder and then through the registered `csharp-nvdec`
+decoder plugin:
+
+```bash
+./build/heicprobe --compare-nvdec image.heic
+```
+
+The plugin accepts libheif's length-prefixed HEVC stream, converts it to
+Annex-B NAL units, decodes with FFmpeg's `hevc_cuvid`, downloads the CUDA
+NV12 frame, and returns an 8-bit YCbCr 4:2:0 `heif_image`. The current scope
+is ordinary opaque 8-bit HEVC images; unsupported formats must use the normal
+libheif path.
 
 ## Status
 

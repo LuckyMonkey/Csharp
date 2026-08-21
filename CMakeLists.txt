@@ -7,12 +7,21 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBHEIF REQUIRED IMPORTED_TARGET libheif)
+pkg_check_modules(LIBAVCODEC REQUIRED IMPORTED_TARGET libavcodec)
+pkg_check_modules(LIBAVUTIL REQUIRED IMPORTED_TARGET libavutil)
+pkg_check_modules(LIBSWSCALE REQUIRED IMPORTED_TARGET libswscale)
 
 add_executable(heicprobe
     src/heicprobe.c
     src/heif_boxes.c
+    src/nvdec_plugin.c
 )
-target_link_libraries(heicprobe PRIVATE PkgConfig::LIBHEIF)
+target_link_libraries(heicprobe PRIVATE
+    PkgConfig::LIBHEIF
+    PkgConfig::LIBAVCODEC
+    PkgConfig::LIBAVUTIL
+    PkgConfig::LIBSWSCALE
+)
 
 target_compile_options(heicprobe PRIVATE
     -Wall
