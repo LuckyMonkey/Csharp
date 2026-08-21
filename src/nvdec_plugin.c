@@ -7,6 +7,7 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,12 +22,28 @@ struct nvdec_decoder {
     size_t input_size;
     size_t input_capacity;
     int strict;
+    int pooled_codec;
 };
 
 static AVBufferRef *shared_cuda_device;
+static AVCodecContext *shared_codec;
+static int shared_codec_in_use;
+static atomic_flag shared_lock = ATOMIC_FLAG_INIT;
 static unsigned long cuda_device_initializations;
 static unsigned long decoder_initializations;
+static unsigned long decoder_reuses;
 static int verbose_logging = 1;
+
+static void lock_shared_state(void)
+{
+    while (atomic_flag_test_and_set_explicit(&shared_lock, memory_order_acquire)) {
+    }
+}
+
+static void unlock_shared_state(void)
+{
+    atomic_flag_clear_explicit(&shared_lock, memory_order_release);
+}
 
 static const char *plugin_name(void)
 {
@@ -64,27 +81,40 @@ static enum AVPixelFormat choose_cuda_format(AVCodecContext *codec,
     return AV_PIX_FMT_NONE;
 }
 
+static AVCodecContext *create_codec_context(AVBufferRef *device_ctx)
+{
+    const AVCodec *codec = avcodec_find_decoder_by_name("hevc_cuvid");
+    AVCodecContext *context;
+
+    if (!codec) return NULL;
+    context = avcodec_alloc_context3(codec);
+    if (!context) return NULL;
+    context->get_format = choose_cuda_format;
+    context->pkt_timebase = (AVRational){1, 90000};
+    context->hw_device_ctx = av_buffer_ref(device_ctx);
+    if (!context->hw_device_ctx || avcodec_open2(context, codec, NULL) < 0) {
+        avcodec_free_context(&context);
+        return NULL;
+    }
+    ++decoder_initializations;
+    return context;
+}
+
 static struct heif_error new_decoder(void **out_decoder)
 {
     struct nvdec_decoder *decoder = calloc(1, sizeof(*decoder));
-    const AVCodec *codec;
-    int ret;
+    AVCodecContext *codec = NULL;
 
     if (!decoder) {
         return plugin_error(heif_error_Memory_allocation_error,
                             heif_suberror_Unspecified, "decoder allocation failed");
     }
-    codec = avcodec_find_decoder_by_name("hevc_cuvid");
-    if (!codec) {
-        free(decoder);
-        return plugin_error(heif_error_Unsupported_feature,
-                            heif_suberror_Unsupported_codec,
-                            "hevc_cuvid decoder is unavailable");
-    }
+
+    lock_shared_state();
     if (!shared_cuda_device) {
-        ret = av_hwdevice_ctx_create(&shared_cuda_device, AV_HWDEVICE_TYPE_CUDA,
-                                     NULL, NULL, 0);
-        if (ret < 0) {
+        if (av_hwdevice_ctx_create(&shared_cuda_device, AV_HWDEVICE_TYPE_CUDA,
+                                   NULL, NULL, 0) < 0) {
+            unlock_shared_state();
             free(decoder);
             return plugin_error(heif_error_Unsupported_feature,
                                 heif_suberror_Unsupported_codec,
@@ -92,34 +122,54 @@ static struct heif_error new_decoder(void **out_decoder)
         }
         ++cuda_device_initializations;
     }
+
     decoder->device_ctx = av_buffer_ref(shared_cuda_device);
     if (!decoder->device_ctx) {
+        unlock_shared_state();
         free(decoder);
         return plugin_error(heif_error_Memory_allocation_error,
                             heif_suberror_Unspecified, "CUDA device reference failed");
     }
-    decoder->codec = avcodec_alloc_context3(codec);
-    if (!decoder->codec) {
-        av_buffer_unref(&decoder->device_ctx);
-        free(decoder);
-        return plugin_error(heif_error_Memory_allocation_error,
-                            heif_suberror_Unspecified, "codec allocation failed");
+
+    if (shared_codec && !shared_codec_in_use) {
+        shared_codec_in_use = 1;
+        decoder->pooled_codec = 1;
+        codec = shared_codec;
+        avcodec_flush_buffers(codec);
+        ++decoder_reuses;
+    } else if (!shared_codec) {
+        shared_codec = create_codec_context(decoder->device_ctx);
+        if (!shared_codec) {
+            av_buffer_unref(&decoder->device_ctx);
+            unlock_shared_state();
+            free(decoder);
+            return plugin_error(heif_error_Unsupported_feature,
+                                heif_suberror_Unsupported_codec,
+                                "cannot open hevc_cuvid decoder");
+        }
+        shared_codec_in_use = 1;
+        decoder->pooled_codec = 1;
+        codec = shared_codec;
     }
-    decoder->codec->get_format = choose_cuda_format;
-    decoder->codec->pkt_timebase = (AVRational){1, 90000};
-    decoder->codec->hw_device_ctx = av_buffer_ref(decoder->device_ctx);
-    ret = avcodec_open2(decoder->codec, codec, NULL);
-    if (ret < 0) {
-        avcodec_free_context(&decoder->codec);
-        av_buffer_unref(&decoder->device_ctx);
-        free(decoder);
-        return plugin_error(heif_error_Unsupported_feature,
-                            heif_suberror_Unsupported_codec,
-                            "cannot open hevc_cuvid decoder");
+    unlock_shared_state();
+
+    if (!codec) {
+        codec = create_codec_context(decoder->device_ctx);
+        if (!codec) {
+            av_buffer_unref(&decoder->device_ctx);
+            free(decoder);
+            return plugin_error(heif_error_Unsupported_feature,
+                                heif_suberror_Unsupported_codec,
+                                "cannot open temporary hevc_cuvid decoder");
+        }
     }
+
+    decoder->codec = codec;
     *out_decoder = decoder;
-    ++decoder_initializations;
-    if (verbose_logging) fprintf(stderr, "csharp-nvdec: initialized hevc_cuvid/NVDEC\n");
+    if (verbose_logging) {
+        fprintf(stderr, "csharp-nvdec: %s hevc_cuvid/NVDEC context\n",
+                decoder->pooled_codec ? "acquired pooled" : "initialized temporary");
+    }
     return ok_error();
 }
 
@@ -127,7 +177,16 @@ static void free_decoder(void *raw_decoder)
 {
     struct nvdec_decoder *decoder = raw_decoder;
     if (!decoder) return;
-    avcodec_free_context(&decoder->codec);
+
+    if (decoder->pooled_codec) {
+        avcodec_flush_buffers(decoder->codec);
+        lock_shared_state();
+        shared_codec_in_use = 0;
+        unlock_shared_state();
+    } else {
+        avcodec_free_context(&decoder->codec);
+    }
+
     av_buffer_unref(&decoder->device_ctx);
     free(decoder->input);
     free(decoder);
@@ -394,6 +453,7 @@ void csharp_nvdec_reset_stats(void)
 {
     cuda_device_initializations = 0;
     decoder_initializations = 0;
+    decoder_reuses = 0;
 }
 
 unsigned long csharp_nvdec_cuda_device_initializations(void)
@@ -404,4 +464,9 @@ unsigned long csharp_nvdec_cuda_device_initializations(void)
 unsigned long csharp_nvdec_decoder_initializations(void)
 {
     return decoder_initializations;
+}
+
+unsigned long csharp_nvdec_decoder_reuses(void)
+{
+    return decoder_reuses;
 }
