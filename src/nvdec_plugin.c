@@ -24,6 +24,9 @@ struct nvdec_decoder {
 };
 
 static AVBufferRef *shared_cuda_device;
+static unsigned long cuda_device_initializations;
+static unsigned long decoder_initializations;
+static int verbose_logging = 1;
 
 static const char *plugin_name(void)
 {
@@ -53,11 +56,11 @@ static enum AVPixelFormat choose_cuda_format(AVCodecContext *codec,
     (void)codec;
     for (const enum AVPixelFormat *p = formats; *p != AV_PIX_FMT_NONE; ++p) {
         if (*p == AV_PIX_FMT_CUDA) {
-            fprintf(stderr, "csharp-nvdec: selected CUDA frame format\n");
+            if (verbose_logging) fprintf(stderr, "csharp-nvdec: selected CUDA frame format\n");
             return *p;
         }
     }
-    fprintf(stderr, "csharp-nvdec: CUDA frame format unavailable\n");
+    if (verbose_logging) fprintf(stderr, "csharp-nvdec: CUDA frame format unavailable\n");
     return AV_PIX_FMT_NONE;
 }
 
@@ -87,6 +90,7 @@ static struct heif_error new_decoder(void **out_decoder)
                                 heif_suberror_Unsupported_codec,
                                 "CUDA device initialization failed");
         }
+        ++cuda_device_initializations;
     }
     decoder->device_ctx = av_buffer_ref(shared_cuda_device);
     if (!decoder->device_ctx) {
@@ -114,7 +118,8 @@ static struct heif_error new_decoder(void **out_decoder)
                             "cannot open hevc_cuvid decoder");
     }
     *out_decoder = decoder;
-    fprintf(stderr, "csharp-nvdec: initialized hevc_cuvid/NVDEC\n");
+    ++decoder_initializations;
+    if (verbose_logging) fprintf(stderr, "csharp-nvdec: initialized hevc_cuvid/NVDEC\n");
     return ok_error();
 }
 
@@ -284,10 +289,12 @@ static struct heif_error decode_image(void *raw_decoder, struct heif_image **out
                            heif_suberror_Unspecified, "decoded frame reference failed");
         goto cleanup;
     }
-    fprintf(stderr, "csharp-nvdec: downloaded format=%s size=%dx%d linesizes=%d,%d,%d data=%p,%p\n",
-            av_get_pix_fmt_name(downloaded->format), downloaded->width, downloaded->height,
-            downloaded->linesize[0], downloaded->linesize[1], downloaded->linesize[2],
-            (void *)downloaded->data[0], (void *)downloaded->data[1]);
+    if (verbose_logging) {
+        fprintf(stderr, "csharp-nvdec: downloaded format=%s size=%dx%d linesizes=%d,%d,%d data=%p,%p\n",
+                av_get_pix_fmt_name(downloaded->format), downloaded->width, downloaded->height,
+                downloaded->linesize[0], downloaded->linesize[1], downloaded->linesize[2],
+                (void *)downloaded->data[0], (void *)downloaded->data[1]);
+    }
     converted_buffer_size = av_image_alloc(converted, converted_stride,
                                             downloaded->width, downloaded->height,
                                             AV_PIX_FMT_YUV420P, 1);
@@ -338,8 +345,10 @@ static struct heif_error decode_image(void *raw_decoder, struct heif_image **out
     err = add_plane_copy(*out_image, heif_channel_Cr, converted[2], converted_stride[2],
                          (downloaded->width + 1) / 2, (downloaded->height + 1) / 2);
     if (err.code != heif_error_Ok) goto cleanup;
-    fprintf(stderr, "csharp-nvdec: decoded %dx%d through CUDA\n",
-            downloaded->width, downloaded->height);
+    if (verbose_logging) {
+        fprintf(stderr, "csharp-nvdec: decoded %dx%d through CUDA\n",
+                downloaded->width, downloaded->height);
+    }
 
 cleanup:
     if (err.code != heif_error_Ok && out_image && *out_image) {
@@ -374,4 +383,25 @@ static const struct heif_decoder_plugin nvdec_plugin = {
 struct heif_error csharp_register_nvdec_plugin(void)
 {
     return heif_register_decoder_plugin(&nvdec_plugin);
+}
+
+void csharp_nvdec_set_verbose(int enabled)
+{
+    verbose_logging = enabled != 0;
+}
+
+void csharp_nvdec_reset_stats(void)
+{
+    cuda_device_initializations = 0;
+    decoder_initializations = 0;
+}
+
+unsigned long csharp_nvdec_cuda_device_initializations(void)
+{
+    return cuda_device_initializations;
+}
+
+unsigned long csharp_nvdec_decoder_initializations(void)
+{
+    return decoder_initializations;
 }

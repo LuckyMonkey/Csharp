@@ -58,6 +58,19 @@ decoder plugin:
 ./build/heicprobe --compare-nvdec image.heic
 ```
 
+The persistent decode-only benchmark loads its inputs into memory once and
+round-robins them in one process. It reports cold startup separately from
+warm repeated decodes:
+
+```bash
+./build/heicprobe --benchmark 100 sample1.heic sample2.heic
+```
+
+The benchmark currently creates one `AVCodecContext`/NVDEC decoder per
+libheif image decode while sharing the CUDA device context. It is intended to
+measure the current implementation and expose that initialization cost, not
+to claim a pooled decoder design.
+
 The plugin accepts libheif's length-prefixed HEVC stream, converts it to
 Annex-B NAL units, decodes with FFmpeg's `hevc_cuvid`, downloads the CUDA
 NV12 frame, and returns an 8-bit YCbCr 4:2:0 `heif_image`. The current scope

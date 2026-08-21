@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <libheif/heif.h>
 
 #include "nvdec_plugin.h"
@@ -8,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static void print_heif_error(const char *what, struct heif_error err)
 {
@@ -128,10 +131,163 @@ cleanup:
     return result;
 }
 
+struct benchmark_input {
+    const char *path;
+    uint8_t *data;
+    size_t size;
+};
+
+static double monotonic_seconds(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static int load_benchmark_input(const char *path, struct benchmark_input *input)
+{
+    FILE *file;
+    long length;
+
+    memset(input, 0, sizeof(*input));
+    file = fopen(path, "rb");
+    if (!file) return -1;
+    if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return -1; }
+    length = ftell(file);
+    if (length <= 0 || fseek(file, 0, SEEK_SET) != 0) { fclose(file); return -1; }
+    input->data = malloc((size_t)length);
+    if (!input->data || fread(input->data, 1, (size_t)length, file) != (size_t)length) {
+        free(input->data);
+        input->data = NULL;
+        fclose(file);
+        return -1;
+    }
+    fclose(file);
+    input->path = path;
+    input->size = (size_t)length;
+    return 0;
+}
+
+static int decode_benchmark_input(const struct benchmark_input *input, bool nvdec)
+{
+    struct heif_context *ctx = NULL;
+    struct heif_image_handle *handle = NULL;
+    struct heif_image *image = NULL;
+    struct heif_decoding_options *options = NULL;
+    struct heif_error err;
+    int result = -1;
+
+    ctx = heif_context_alloc();
+    if (!ctx) goto cleanup;
+    err = heif_context_read_from_memory_without_copy(ctx, input->data, input->size, NULL);
+    if (err.code != heif_error_Ok) goto cleanup;
+    err = heif_context_get_primary_image_handle(ctx, &handle);
+    if (err.code != heif_error_Ok || !handle) goto cleanup;
+    if (nvdec) {
+        options = heif_decoding_options_alloc();
+        if (!options) goto cleanup;
+        options->decoder_id = "csharp-nvdec";
+    }
+    err = heif_decode_image(handle, &image, heif_colorspace_YCbCr,
+                            heif_chroma_420, options);
+    if (err.code == heif_error_Ok) result = 0;
+
+cleanup:
+    heif_decoding_options_free(options);
+    heif_image_release(image);
+    heif_image_handle_release(handle);
+    heif_context_free(ctx);
+    return result;
+}
+
+static double benchmark_decodes(const struct benchmark_input *inputs, size_t input_count,
+                                size_t iterations, bool nvdec)
+{
+    double start = monotonic_seconds();
+    for (size_t i = 0; i < iterations; ++i) {
+        if (decode_benchmark_input(&inputs[i % input_count], nvdec) != 0) return -1.0;
+    }
+    return monotonic_seconds() - start;
+}
+
+static void print_timing(const char *label, double seconds, size_t iterations)
+{
+    printf("%s: total=%.6f seconds ms/image=%.3f images/sec=%.2f\n",
+           label, seconds, seconds * 1000.0 / (double)iterations,
+           (double)iterations / seconds);
+}
+
+static int run_benchmark(size_t iterations, int file_count, char **paths)
+{
+    struct benchmark_input *inputs = calloc((size_t)file_count, sizeof(*inputs));
+    struct heif_error err;
+    double seconds;
+    int result = EXIT_FAILURE;
+
+    if (!inputs) return EXIT_FAILURE;
+    csharp_nvdec_set_verbose(0);
+    for (int i = 0; i < file_count; ++i) {
+        if (load_benchmark_input(paths[i], &inputs[i]) != 0) {
+            fprintf(stderr, "heicprobe: cannot load benchmark input: %s\n", paths[i]);
+            goto cleanup;
+        }
+    }
+    printf("Benchmark: %zu iterations, %d distinct in-memory inputs (round-robin)\n",
+           iterations, file_count);
+
+    seconds = benchmark_decodes(inputs, (size_t)file_count, 1, false);
+    if (seconds < 0.0) { fputs("CPU cold decode failed\n", stderr); goto cleanup; }
+    print_timing("CPU cold", seconds, 1);
+    if (decode_benchmark_input(&inputs[0], false) != 0) {
+        fputs("CPU warm-up failed\n", stderr); goto cleanup;
+    }
+    seconds = benchmark_decodes(inputs, (size_t)file_count, iterations, false);
+    if (seconds < 0.0) { fputs("CPU warm decode failed\n", stderr); goto cleanup; }
+    print_timing("CPU warm", seconds, iterations);
+
+    csharp_nvdec_reset_stats();
+    seconds = monotonic_seconds();
+    err = csharp_register_nvdec_plugin();
+    if (err.code != heif_error_Ok) {
+        print_heif_error("heicprobe: NVDEC plugin registration failed", err);
+        goto cleanup;
+    }
+    if (decode_benchmark_input(&inputs[0], true) != 0) {
+        fputs("NVDEC cold decode failed\n", stderr); goto cleanup;
+    }
+    seconds = monotonic_seconds() - seconds;
+    print_timing("NVDEC cold (registration + CUDA + decode)", seconds, 1);
+    if (decode_benchmark_input(&inputs[0], true) != 0) {
+        fputs("NVDEC warm-up failed\n", stderr); goto cleanup;
+    }
+    seconds = benchmark_decodes(inputs, (size_t)file_count, iterations, true);
+    if (seconds < 0.0) { fputs("NVDEC warm decode failed\n", stderr); goto cleanup; }
+    print_timing("NVDEC warm", seconds, iterations);
+    printf("NVDEC initialization counts: CUDA devices=%lu AVCodecContext/NVDEC=%lu\n",
+           csharp_nvdec_cuda_device_initializations(),
+           csharp_nvdec_decoder_initializations());
+    result = EXIT_SUCCESS;
+
+cleanup:
+    for (int i = 0; i < file_count; ++i) free(inputs[i].data);
+    free(inputs);
+    return result;
+}
+
 int main(int argc, char **argv)
 {
     const char *path;
     bool compare = false;
+
+    if (argc >= 4 && strcmp(argv[1], "--benchmark") == 0) {
+        char *end = NULL;
+        unsigned long long requested = strtoull(argv[2], &end, 10);
+        if (!end || *end != '\0' || requested == 0 || requested > SIZE_MAX) {
+            fputs("usage: heicprobe --benchmark <iterations> <file...>\n", stderr);
+            return EXIT_FAILURE;
+        }
+        return run_benchmark((size_t)requested, argc - 3, argv + 3);
+    }
 
     if (argc == 2) {
         path = argv[1];
@@ -139,7 +295,8 @@ int main(int argc, char **argv)
         compare = true;
         path = argv[2];
     } else {
-        fprintf(stderr, "usage: %s [--compare-nvdec] <image.heic|image.heif>\n", argv[0]);
+        fprintf(stderr, "usage: %s [--compare-nvdec] <image.heic|image.heif>\n"
+                        "       %s --benchmark <iterations> <file...>\n", argv[0], argv[0]);
         return EXIT_FAILURE;
     }
 
