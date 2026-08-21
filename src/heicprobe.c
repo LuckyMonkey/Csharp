@@ -45,7 +45,7 @@ static int collect_stats(const struct heif_image *image, struct image_stats *sta
     height = heif_image_get_primary_height(image);
     stats->width = width;
     stats->height = height;
-    stats->hash = UINT64_C(1469598103934665603);
+    stats->hash = UINT64_C(14695981039346656037);
     for (size_t c = 0; c < 3; ++c) {
         int stride = 0;
         int plane_width = c == 0 ? width : (width + 1) / 2;
@@ -68,16 +68,23 @@ static int compare_images(const struct heif_image *cpu, const struct heif_image 
         fputs("heicprobe: cannot collect decoded image planes\n", stderr);
         return -1;
     }
-    printf("CPU image: %dx%d bytes=%" PRIu64 " hash=%016" PRIx64 "\n",
+    printf("CPU image: %dx%d bytes=%" PRIu64 " fnv1a=%016" PRIx64 "\n",
            cpu_stats.width, cpu_stats.height, cpu_stats.bytes, cpu_stats.hash);
-    printf("NVDEC image: %dx%d bytes=%" PRIu64 " hash=%016" PRIx64 "\n",
+    printf("NVDEC image: %dx%d bytes=%" PRIu64 " fnv1a=%016" PRIx64 "\n",
            gpu_stats.width, gpu_stats.height, gpu_stats.bytes, gpu_stats.hash);
     if (cpu_stats.width != gpu_stats.width || cpu_stats.height != gpu_stats.height ||
         cpu_stats.bytes != gpu_stats.bytes) {
         fputs("Pixel comparison: dimensions or plane sizes differ\n", stderr);
         return -1;
     }
-    puts("Pixel comparison: matching dimensions and plane byte counts");
+    if (cpu_stats.hash != gpu_stats.hash) {
+        fprintf(stderr,
+                "Pixel comparison: decoded bytes differ (CPU=%016" PRIx64
+                ", NVDEC=%016" PRIx64 ")\n",
+                cpu_stats.hash, gpu_stats.hash);
+        return -1;
+    }
+    puts("Pixel comparison: exact YCbCr plane match");
     return 0;
 }
 
