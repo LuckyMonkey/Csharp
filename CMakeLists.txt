@@ -8,7 +8,10 @@ set(CMAKE_C_EXTENSIONS OFF)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBHEIF REQUIRED IMPORTED_TARGET libheif)
 
-add_executable(heicprobe src/heicprobe.c)
+add_executable(heicprobe
+    src/heicprobe.c
+    src/heif_boxes.c
+)
 target_link_libraries(heicprobe PRIVATE PkgConfig::LIBHEIF)
 
 target_compile_options(heicprobe PRIVATE
