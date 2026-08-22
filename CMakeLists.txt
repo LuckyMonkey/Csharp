@@ -70,6 +70,7 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
 
     add_library(csharp-direct-nvdecode STATIC
         src/direct_nvdec.c
+        src/direct_nvdec_memory.c
     )
     target_include_directories(csharp-direct-nvdecode SYSTEM PRIVATE
         ${NVCUVID_INCLUDE_DIR}
@@ -93,6 +94,23 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
         -Wall
         -Wextra
         -Wpedantic
+    )
+
+    add_executable(csharp-nvdecode-memory-probe
+        src/direct_nvdec_memory_probe.c
+    )
+    target_include_directories(csharp-nvdecode-memory-probe SYSTEM PRIVATE
+        ${CUDA_DRIVER_INCLUDE_DIR}
+    )
+    target_link_libraries(csharp-nvdecode-memory-probe PRIVATE
+        csharp-direct-nvdecode
+        ${CUDA_DRIVER_LIBRARY}
+    )
+    target_compile_options(csharp-nvdecode-memory-probe PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Werror
     )
 
     add_executable(csharp-direct-heicprobe
@@ -144,7 +162,10 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
     set_target_properties(csharp-nvcuvid-trace PROPERTIES
         OUTPUT_NAME "csharp-nvcuvid-trace")
 
-    list(APPEND CSHARP_INSTALL_TARGETS csharp-nvdecode-probe csharp-direct-heicprobe)
+    list(APPEND CSHARP_INSTALL_TARGETS
+        csharp-nvdecode-probe
+        csharp-nvdecode-memory-probe
+        csharp-direct-heicprobe)
 endif()
 
 install(TARGETS ${CSHARP_INSTALL_TARGETS} RUNTIME DESTINATION bin)
