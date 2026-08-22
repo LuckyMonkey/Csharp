@@ -19,6 +19,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "input_classify.h"
+
 #ifdef CSHARP_HAVE_DIRECT_NVDEC
 #include "direct_nvdec_plugin.h"
 #endif
@@ -28,6 +30,22 @@
 #define MAX_JPEG_MARKER 65533U
 
 enum backend { BACKEND_DIRECT, BACKEND_CPU };
+
+struct conversion_report {
+    const char *input;
+    const char *output;
+    const char *requested_backend;
+    const char *selected_decode_path;
+    const char *error_stage;
+    struct csharp_input_classification classification;
+    int quality;
+    int width;
+    int height;
+    int metadata_exif_count;
+    int metadata_xmp_count;
+    int icc_present;
+    int status;
+};
 
 struct jpeg_failure {
     struct jpeg_error_mgr base;
@@ -363,17 +381,51 @@ done:
     return result;
 }
 
-static int direct_eligible(struct heif_image_handle *handle)
+static void inspect_metadata(const struct heif_image_handle *handle,
+                             struct conversion_report *report)
 {
-    enum heif_colorspace colorspace = heif_colorspace_undefined;
-    enum heif_chroma chroma = heif_chroma_undefined;
-    int bits = heif_image_handle_get_luma_bits_per_pixel(handle);
-    int chroma_bits = heif_image_handle_get_chroma_bits_per_pixel(handle);
-    if (bits != 8 || chroma_bits != 8 || heif_image_handle_has_alpha_channel(handle)) return 0;
-    if (heif_image_handle_get_preferred_decoding_colorspace(handle, &colorspace, &chroma).code != heif_error_Ok ||
-        (colorspace != heif_colorspace_YCbCr && colorspace != heif_colorspace_undefined) ||
-        (chroma != heif_chroma_420 && chroma != heif_chroma_undefined)) return 0;
-    return 1;
+    int count = heif_image_handle_get_number_of_metadata_blocks(handle, NULL);
+    heif_item_id *ids;
+    if (!report || count <= 0) return;
+    ids = calloc((size_t)count, sizeof(*ids));
+    if (!ids) return;
+    count = heif_image_handle_get_list_of_metadata_block_IDs(handle, NULL, ids, count);
+    for (int i = 0; i < count; ++i) {
+        const char *type = heif_image_handle_get_metadata_type(handle, ids[i]);
+        const char *content = heif_image_handle_get_metadata_content_type(handle, ids[i]);
+        if (type && strcmp(type, "Exif") == 0) ++report->metadata_exif_count;
+        if ((type && strcmp(type, "XMP") == 0) ||
+            (content && strcmp(content, "application/rdf+xml") == 0))
+            ++report->metadata_xmp_count;
+    }
+    free(ids);
+    report->icc_present = heif_image_handle_get_raw_color_profile_size(handle) > 0 ? 1 : 0;
+}
+
+static int write_report(const char *path, const struct conversion_report *report)
+{
+    FILE *file;
+    if (!path || !report) return 0;
+    file = fopen(path, "w");
+    if (!file) return -1;
+    fprintf(file, "input\toutput\trequested_backend\tselected_decode_path\tdirect_eligible\t"
+                 "fallback_reason\twidth\theight\tluma_bits\tchroma_bits\thas_alpha\tquality\t"
+                 "metadata_exif_count\tmetadata_xmp_count\ticc_present\tstatus\terror_stage\n");
+    fprintf(file, "%s\t%s\t%s\t%s\t%d\t%s\t"
+                 "%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n",
+            report->input ? report->input : "",
+            report->output ? report->output : "",
+            report->requested_backend ? report->requested_backend : "",
+            report->selected_decode_path ? report->selected_decode_path : "unknown",
+            report->classification.direct_eligible,
+            csharp_fallback_reason_name(report->classification.reason),
+            report->width, report->height,
+            report->classification.luma_bits, report->classification.chroma_bits,
+            report->classification.has_alpha, report->quality,
+            report->metadata_exif_count, report->metadata_xmp_count,
+            report->icc_present, report->status == 0 ? "success" : "failed",
+            report->error_stage ? report->error_stage : "");
+    return fclose(file) == 0 ? 0 : -1;
 }
 
 static int make_temp_path(const char *output, char *temp, size_t capacity, int *fd)
@@ -392,7 +444,8 @@ static int install_output(const char *temp, const char *output, int overwrite)
 }
 
 static int convert_file(const char *input, const char *output, int overwrite,
-                        enum backend backend, int quality, int verbose)
+                        enum backend backend, int quality, int verbose,
+                        const char *report_path, int no_fallback)
 {
     struct heif_context *ctx = NULL;
     struct heif_image_handle *handle = NULL;
@@ -405,23 +458,50 @@ static int convert_file(const char *input, const char *output, int overwrite,
     int result = -1;
     int fast_path;
     int use_direct;
+    struct conversion_report report;
+
+    memset(&report, 0, sizeof(report));
+    report.input = input;
+    report.output = output;
+    report.requested_backend = backend == BACKEND_DIRECT ? "direct" : "cpu";
+    report.selected_decode_path = "unknown";
+    report.error_stage = "none";
+    report.quality = quality;
 
     temp[0] = '\0';
 
     if (!overwrite && access(output, F_OK) == 0) {
+        report.error_stage = "output-exists";
         fprintf(stderr, "csharp: destination exists (use --overwrite): %s\n", output);
-        return -1;
+        goto cleanup;
     }
     ctx = heif_context_alloc();
-    if (!ctx) { fputs("csharp: cannot allocate libheif context\n", stderr); goto cleanup; }
+    if (!ctx) { report.error_stage = "context"; fputs("csharp: cannot allocate libheif context\n", stderr); goto cleanup; }
     error = heif_context_read_from_file(ctx, input, NULL);
-    if (error.code != heif_error_Ok) { print_heif_error("read input", error); goto cleanup; }
+    if (error.code != heif_error_Ok) { report.error_stage = "read"; print_heif_error("read input", error); goto cleanup; }
     error = heif_context_get_primary_image_handle(ctx, &handle);
-    if (error.code != heif_error_Ok) { print_heif_error("get primary image", error); goto cleanup; }
-    fast_path = direct_eligible(handle);
+    if (error.code != heif_error_Ok) { report.error_stage = "primary"; print_heif_error("get primary image", error); goto cleanup; }
+    csharp_classify_input(handle, &report.classification);
+    report.width = heif_image_handle_get_width(handle);
+    report.height = heif_image_handle_get_height(handle);
+    inspect_metadata(handle, &report);
+    fast_path = report.classification.direct_eligible;
     use_direct = backend == BACKEND_DIRECT && fast_path;
+    if (backend == BACKEND_CPU) {
+        report.classification.reason = CSHARP_REASON_CPU_REQUESTED;
+        report.selected_decode_path = "cpu";
+    } else if (!fast_path) {
+        report.selected_decode_path = "cpu-fallback-feature";
+    } else {
+        report.selected_decode_path = "direct";
+    }
     if (backend == BACKEND_DIRECT && !fast_path && verbose)
         fputs("csharp: using libheif CPU fallback for non-NVDEC HEIC features\n", stderr);
+    if (backend == BACKEND_DIRECT && !fast_path && no_fallback) {
+        report.error_stage = "classification";
+        fputs("csharp: input is not eligible for direct NVDEC and --no-fallback was set\n", stderr);
+        goto cleanup;
+    }
     if (backend == BACKEND_DIRECT) {
 #ifdef CSHARP_HAVE_DIRECT_NVDEC
         if (use_direct) {
@@ -429,12 +509,13 @@ static int convert_file(const char *input, const char *output, int overwrite,
             if (error.code != heif_error_Ok) { print_heif_error("register direct decoder", error); goto cleanup; }
         }
 #else
+        report.error_stage = "backend";
         fputs("csharp: direct backend was not built; use --backend cpu or rebuild with CUDA\n", stderr);
         goto cleanup;
 #endif
     }
     options = heif_decoding_options_alloc();
-    if (!options) { fputs("csharp: cannot allocate decoding options\n", stderr); goto cleanup; }
+    if (!options) { report.error_stage = "options"; fputs("csharp: cannot allocate decoding options\n", stderr); goto cleanup; }
     if (use_direct) {
 #ifdef CSHARP_HAVE_DIRECT_NVDEC
         options->decoder_id = "csharp-direct-nvdec";
@@ -447,6 +528,8 @@ static int convert_file(const char *input, const char *output, int overwrite,
                                heif_chroma_interleaved_RGBA : heif_chroma_interleaved_RGB),
                               options);
     if (error.code != heif_error_Ok && use_direct) {
+        report.classification.reason = CSHARP_REASON_DIRECT_DECODE_FAILED;
+        report.selected_decode_path = "cpu-fallback-decode-failure";
         if (verbose) fputs("csharp: direct decode failed; retrying with libheif CPU decoder\n", stderr);
         heif_image_release(image);
         image = NULL;
@@ -454,24 +537,24 @@ static int convert_file(const char *input, const char *output, int overwrite,
         error = heif_decode_image(handle, &image, heif_colorspace_YCbCr,
                                   heif_chroma_420, options);
     }
-    if (error.code != heif_error_Ok) { print_heif_error("decode image", error); goto cleanup; }
+    if (error.code != heif_error_Ok) { report.error_stage = "decode"; print_heif_error("decode image", error); goto cleanup; }
     if (make_temp_path(output, temp, sizeof(temp), &fd) != 0) {
-        fprintf(stderr, "csharp: cannot create temporary output: %s\n", strerror(errno)); goto cleanup;
+        report.error_stage = "temp-output"; fprintf(stderr, "csharp: cannot create temporary output: %s\n", strerror(errno)); goto cleanup;
     }
     file = fdopen(fd, "wb");
     if (!file) { close(fd); fd = -1; goto cleanup; }
     fd = -1;
     if (verbose) fprintf(stderr, "csharp: encoding %dx%d -> %s\n",
                          heif_image_get_primary_width(image), heif_image_get_primary_height(image), output);
-    if (encode_jpeg(file, image, handle, quality) != 0) goto cleanup;
+    if (encode_jpeg(file, image, handle, quality) != 0) { report.error_stage = "encode"; goto cleanup; }
     if (fflush(file) != 0 || fsync(fileno(file)) != 0 || fclose(file) != 0) {
-        file = NULL; fputs("csharp: failed to flush JPEG output\n", stderr); goto cleanup;
+        file = NULL; report.error_stage = "flush-output"; fputs("csharp: failed to flush JPEG output\n", stderr); goto cleanup;
     }
     file = NULL;
     if (overwrite) {
-        if (rename(temp, output) != 0) goto cleanup;
+        if (rename(temp, output) != 0) { report.error_stage = "install"; goto cleanup; }
     } else if (install_output(temp, output, 0) != 0) {
-        fprintf(stderr, "csharp: atomic rename failed: %s\n", strerror(errno)); goto cleanup;
+        report.error_stage = "install"; fprintf(stderr, "csharp: atomic rename failed: %s\n", strerror(errno)); goto cleanup;
     }
     result = 0;
 cleanup:
@@ -482,6 +565,9 @@ cleanup:
     heif_decoding_options_free(options);
     heif_image_handle_release(handle);
     heif_context_free(ctx);
+    report.status = result == 0 ? 0 : 1;
+    if (write_report(report_path, &report) != 0)
+        fprintf(stderr, "csharp: cannot write report: %s\n", strerror(errno));
     return result;
 }
 
@@ -491,6 +577,8 @@ static void usage(FILE *stream)
                    "  --quality N       JPEG quality 1-100 (default %d)\n"
                    "  --overwrite       replace an existing destination\n"
                    "  --backend direct|cpu\n"
+                   "  --no-fallback     fail instead of using CPU fallback\n"
+                   "  --report PATH     write one machine-readable TSV result\n"
                    "  --verbose         print conversion diagnostics\n"
                    "  --version         print version\n"
                    "  --help            print this help\n", DEFAULT_QUALITY);
@@ -504,12 +592,16 @@ int main(int argc, char **argv)
     int quality = DEFAULT_QUALITY;
     int overwrite = 0;
     int verbose = 0;
+    int no_fallback = 0;
+    const char *report_path = NULL;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--help") == 0) { usage(stdout); return EXIT_SUCCESS; }
         if (strcmp(argv[i], "--version") == 0) { puts(CSHARP_VERSION); return EXIT_SUCCESS; }
         if (strcmp(argv[i], "--overwrite") == 0) { overwrite = 1; continue; }
         if (strcmp(argv[i], "--verbose") == 0) { verbose = 1; continue; }
+        if (strcmp(argv[i], "--no-fallback") == 0) { no_fallback = 1; continue; }
+        if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) { report_path = argv[++i]; continue; }
         if (strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
             char *end = NULL; long value = strtol(argv[++i], &end, 10);
             if (!end || *end != '\0' || value < 1 || value > 100) {
@@ -530,5 +622,6 @@ int main(int argc, char **argv)
         else { fputs("csharp: expected one input and one output\n", stderr); return EXIT_FAILURE; }
     }
     if (!input || !output) { usage(stderr); return EXIT_FAILURE; }
-    return convert_file(input, output, overwrite, backend, quality, verbose) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return convert_file(input, output, overwrite, backend, quality, verbose,
+                        report_path, no_fallback) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

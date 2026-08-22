@@ -17,23 +17,18 @@ decode_fallback=0
 cpu=0
 failed=0
 
-while IFS=$'\t' read -r repeat index status requested input output bytes log; do
+while IFS=$'\t' read -r repeat index status requested observed reason input output bytes log report; do
   [[ $repeat == repeat ]] && continue
-  observed=unknown
   if [[ $status != ok ]]; then
     observed=failed
     ((++failed))
-  elif [[ $requested == cpu ]]; then
-    observed=cpu
+  elif [[ $observed == cpu ]]; then
     ((++cpu))
-  elif grep -q 'direct decode failed; retrying with libheif CPU decoder' "$log" 2>/dev/null; then
-    observed=cpu-fallback-decode-failure
+  elif [[ $observed == cpu-fallback-decode-failure ]]; then
     ((++decode_fallback))
-  elif grep -q 'using libheif CPU fallback for non-NVDEC HEIC features' "$log" 2>/dev/null; then
-    observed=cpu-fallback-feature
+  elif [[ $observed == cpu-fallback-feature ]]; then
     ((++feature_fallback))
   else
-    observed=direct
     ((++direct))
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$repeat" "$index" "$status" "$requested" "$observed" "$input"

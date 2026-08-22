@@ -21,6 +21,7 @@ read -r -a libs <<<"$(pkg-config --libs libheif)"
 "$cc" -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror \
   "${cflags[@]}" \
   "$root/src/csharp_inspect.c" \
+  "$root/src/input_classify.c" \
   -o "$out/csharp-inspect" \
   "${libs[@]}"
 

@@ -1,31 +1,10 @@
 #include <libheif/heif.h>
 
+#include "input_classify.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static int direct_eligible(struct heif_image_handle *handle,
-                           enum heif_colorspace *colorspace_out,
-                           enum heif_chroma *chroma_out)
-{
-    enum heif_colorspace colorspace = heif_colorspace_undefined;
-    enum heif_chroma chroma = heif_chroma_undefined;
-    int bits = heif_image_handle_get_luma_bits_per_pixel(handle);
-    int chroma_bits = heif_image_handle_get_chroma_bits_per_pixel(handle);
-
-    if (heif_image_handle_get_preferred_decoding_colorspace(handle, &colorspace, &chroma).code !=
-        heif_error_Ok) {
-        colorspace = heif_colorspace_undefined;
-        chroma = heif_chroma_undefined;
-    }
-    if (colorspace_out) *colorspace_out = colorspace;
-    if (chroma_out) *chroma_out = chroma;
-
-    if (bits != 8 || chroma_bits != 8 || heif_image_handle_has_alpha_channel(handle)) return 0;
-    if (colorspace != heif_colorspace_YCbCr && colorspace != heif_colorspace_undefined) return 0;
-    if (chroma != heif_chroma_420 && chroma != heif_chroma_undefined) return 0;
-    return 1;
-}
 
 static const char *colorspace_name(enum heif_colorspace value)
 {
@@ -57,8 +36,7 @@ static int inspect_file(const char *path, int tsv, int header)
     struct heif_context *ctx = NULL;
     struct heif_image_handle *handle = NULL;
     struct heif_error err;
-    enum heif_colorspace colorspace = heif_colorspace_undefined;
-    enum heif_chroma chroma = heif_chroma_undefined;
+    struct csharp_input_classification classification;
     int width, height, luma_bits, chroma_bits, alpha, metadata, top_level, eligible;
     size_t icc_size;
     int result = 1;
@@ -89,27 +67,30 @@ static int inspect_file(const char *path, int tsv, int header)
     metadata = heif_image_handle_get_number_of_metadata_blocks(handle, NULL);
     top_level = heif_context_get_number_of_top_level_images(ctx);
     icc_size = heif_image_handle_get_raw_color_profile_size(handle);
-    eligible = direct_eligible(handle, &colorspace, &chroma);
+    csharp_classify_input(handle, &classification);
+    eligible = classification.direct_eligible;
 
     if (tsv) {
         if (header) {
-            puts("path\twidth\theight\tluma_bits\tchroma_bits\talpha\tcolorspace\tchroma\tmetadata_blocks\ticc_bytes\ttop_level_images\tdirect_eligible\tpredicted_path");
+            puts("path\twidth\theight\tluma_bits\tchroma_bits\talpha\tcolorspace\tchroma\tmetadata_blocks\ticc_bytes\ttop_level_images\tdirect_eligible\tfallback_reason\tpredicted_path");
         }
-        printf("%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%d\t%zu\t%d\t%d\t%s\n",
-               path, width, height, luma_bits, chroma_bits, alpha,
-               colorspace_name(colorspace), chroma_name(chroma), metadata, icc_size,
-               top_level, eligible, eligible ? "direct" : "cpu-fallback");
+        printf("%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%d\t%zu\t%d\t%d\t%s\t%s\n",
+            path, width, height, luma_bits, chroma_bits, alpha,
+               colorspace_name(classification.colorspace), chroma_name(classification.chroma), metadata, icc_size,
+               top_level, eligible, csharp_fallback_reason_name(classification.reason),
+               eligible ? "direct" : "cpu-fallback");
     } else {
         printf("%s\n", path);
         printf("  dimensions: %dx%d\n", width, height);
         printf("  bit depth: luma=%d chroma=%d\n", luma_bits, chroma_bits);
         printf("  alpha: %s\n", alpha ? "yes" : "no");
         printf("  preferred decode: %s / %s\n",
-               colorspace_name(colorspace), chroma_name(chroma));
+               colorspace_name(classification.colorspace), chroma_name(classification.chroma));
         printf("  metadata blocks: %d\n", metadata);
         printf("  ICC bytes: %zu\n", icc_size);
         printf("  top-level images: %d\n", top_level);
         printf("  direct eligible: %s\n", eligible ? "yes" : "no");
+        printf("  fallback reason: %s\n", csharp_fallback_reason_name(classification.reason));
         printf("  predicted path: %s\n", eligible ? "direct" : "cpu-fallback");
     }
     result = 0;

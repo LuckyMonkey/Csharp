@@ -90,7 +90,7 @@ outputs=$work_dir/outputs
 logs=$work_dir/logs
 mkdir -p "$outputs" "$logs"
 summary=$work_dir/summary.tsv
-printf 'repeat\tindex\tstatus\tbackend_requested\tinput\toutput\tbytes\tlog\n' > "$summary"
+printf 'repeat\tindex\tstatus\tbackend_requested\tselected_decode_path\tfallback_reason\tinput\toutput\tbytes\tlog\treport\n' > "$summary"
 
 mapfile -d '' files < <(
   find "$input_dir" -type f \( \
@@ -138,13 +138,14 @@ for ((r=1; r<=repeat; ++r)); do
     safe=$(printf '%s' "$rel" | tr '/\t\r\n' '____')
     output="$outputs/r${r}-$(printf '%05d' "$index")-${safe%.*}.jpg"
     log="$logs/r${r}-$(printf '%05d' "$index").log"
+    report="$logs/r${r}-$(printf '%05d' "$index").tsv"
 
     if ((verbose)); then
       printf '[%d/%d r%d] %s\n' "$index" "${#files[@]}" "$r" "$input" >&2
     fi
 
     status=ok
-    if ! "$binary" --backend "$backend" --quality "$quality" --verbose \
+    if ! "$binary" --backend "$backend" --quality "$quality" --report "$report" --verbose \
           "$input" "$output" >"$log.stdout" 2>"$log"; then
       status=convert-failed
     elif ! jpeg_valid "$output"; then
@@ -161,8 +162,15 @@ for ((r=1; r<=repeat; ++r)); do
       if ((verbose)); then sed -n '1,120p' "$log" >&2 || true; fi
     fi
 
-    printf '%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$r" "$index" "$status" "$backend" "$input" "$output" "$bytes" "$log" >> "$summary"
+    selected=unknown
+    reason=unknown
+    if [[ -s $report ]]; then
+      IFS=$'\t' read -r _ _ _ _ _ reason _ _ _ _ _ _ _ _ _ _ _ < <(tail -n 1 "$report")
+      IFS=$'\t' read -r _ _ _ selected _ _ _ _ _ _ _ _ _ _ _ _ _ < <(tail -n 1 "$report")
+    fi
+    printf '%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$r" "$index" "$status" "$backend" "$selected" "$reason" \
+      "$input" "$output" "$bytes" "$log" "$report" >> "$summary"
   done
 done
 

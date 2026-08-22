@@ -17,6 +17,7 @@ pkg_check_modules(LIBJPEG REQUIRED IMPORTED_TARGET libjpeg)
 
 add_executable(csharp
     src/csharp.c
+    src/input_classify.c
 )
 target_link_libraries(csharp PRIVATE
     PkgConfig::LIBHEIF
