@@ -677,7 +677,6 @@ static struct heif_error make_image(struct direct_decoder *decoder,
     direct_timing_record(CSHARP_DIRECT_STAGE_COPY_UV, start);
 
     start = csharp_direct_now_ns();
-    start = csharp_direct_now_ns();
     for (int row = 0; row < chroma_height; ++row) {
         const uint8_t *restrict src = decoder->uv_staging + (size_t)row * uv_row_bytes;
         uint8_t *restrict dst_cb = cb + (size_t)row * (size_t)cb_stride;
