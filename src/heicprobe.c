@@ -91,7 +91,8 @@ static int compare_images(const struct heif_image *cpu, const struct heif_image 
     return 0;
 }
 
-static int run_nvdec_comparison(struct heif_image_handle *handle)
+static int run_nvdec_comparison(struct heif_image_handle *handle,
+                                enum csharp_nvdec_backend backend)
 {
     struct heif_image *cpu_image = NULL;
     struct heif_image *nvdec_image = NULL;
@@ -110,6 +111,7 @@ static int run_nvdec_comparison(struct heif_image_handle *handle)
         print_heif_error("heicprobe: NVDEC plugin registration failed", err);
         goto cleanup;
     }
+    csharp_nvdec_set_backend(backend);
     options = heif_decoding_options_alloc();
     if (!options) {
         fputs("heicprobe: cannot allocate decoding options\n", stderr);
@@ -311,6 +313,7 @@ int main(int argc, char **argv)
 {
     const char *path;
     bool compare = false;
+    enum csharp_nvdec_backend backend = CSHARP_NVDEC_BACKEND_CUVID;
 
     if (argc >= 4 && strcmp(argv[1], "--benchmark") == 0) {
         char *end = NULL;
@@ -327,9 +330,20 @@ int main(int argc, char **argv)
     } else if (argc == 3 && strcmp(argv[1], "--compare-nvdec") == 0) {
         compare = true;
         path = argv[2];
+    } else if (argc == 5 && strcmp(argv[1], "--compare-nvdec") == 0 &&
+               strcmp(argv[2], "--backend") == 0) {
+        if (strcmp(argv[3], "cuvid") == 0) backend = CSHARP_NVDEC_BACKEND_CUVID;
+        else if (strcmp(argv[3], "native") == 0) backend = CSHARP_NVDEC_BACKEND_NATIVE;
+        else {
+            fputs("heicprobe: backend must be cuvid or native\n", stderr);
+            return EXIT_FAILURE;
+        }
+        compare = true;
+        path = argv[4];
     } else {
         fprintf(stderr, "usage: %s [--compare-nvdec] <image.heic|image.heif>\n"
-                        "       %s --benchmark <iterations> <file...>\n", argv[0], argv[0]);
+                        "       %s --compare-nvdec --backend cuvid|native <image.heic|image.heif>\n"
+                        "       %s --benchmark <iterations> <file...>\n", argv[0], argv[0], argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -380,7 +394,7 @@ int main(int argc, char **argv)
     printf("NVDEC candidate: %s\n", plausible_fast_path ? "yes" : "no/fallback");
 
     if (compare) {
-        int result = run_nvdec_comparison(handle);
+        int result = run_nvdec_comparison(handle, backend);
         heif_image_handle_release(handle);
         heif_context_free(ctx);
         return result;
