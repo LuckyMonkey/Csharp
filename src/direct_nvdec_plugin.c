@@ -679,10 +679,24 @@ static struct heif_error make_image(struct direct_decoder *decoder,
     start = csharp_direct_now_ns();
     start = csharp_direct_now_ns();
     for (int row = 0; row < chroma_height; ++row) {
-        const uint8_t *src = decoder->uv_staging + (size_t)row * uv_row_bytes;
-        uint8_t *dst_cb = cb + (size_t)row * (size_t)cb_stride;
-        uint8_t *dst_cr = cr + (size_t)row * (size_t)cr_stride;
-        for (int col = 0; col < chroma_width; ++col) {
+        const uint8_t *restrict src = decoder->uv_staging + (size_t)row * uv_row_bytes;
+        uint8_t *restrict dst_cb = cb + (size_t)row * (size_t)cb_stride;
+        uint8_t *restrict dst_cr = cr + (size_t)row * (size_t)cr_stride;
+        int col = 0;
+        for (; col + 3 < chroma_width; col += 4) {
+            dst_cb[0] = src[0];
+            dst_cr[0] = src[1];
+            dst_cb[1] = src[2];
+            dst_cr[1] = src[3];
+            dst_cb[2] = src[4];
+            dst_cr[2] = src[5];
+            dst_cb[3] = src[6];
+            dst_cr[3] = src[7];
+            src += 8;
+            dst_cb += 4;
+            dst_cr += 4;
+        }
+        for (; col < chroma_width; ++col) {
             *dst_cb++ = *src++;
             *dst_cr++ = *src++;
         }
