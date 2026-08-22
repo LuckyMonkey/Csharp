@@ -95,7 +95,26 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
         -Wpedantic
     )
 
-    list(APPEND CSHARP_INSTALL_TARGETS csharp-nvdecode-probe)
+    add_executable(csharp-direct-heicprobe
+        src/direct_heicprobe.c
+        src/direct_nvdec_plugin.c
+    )
+    target_include_directories(csharp-direct-heicprobe SYSTEM PRIVATE
+        ${NVCUVID_INCLUDE_DIR}
+        ${CUDA_DRIVER_INCLUDE_DIR}
+    )
+    target_link_libraries(csharp-direct-heicprobe PRIVATE
+        PkgConfig::LIBHEIF
+        csharp-direct-nvdecode
+    )
+    target_compile_options(csharp-direct-heicprobe PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Werror
+    )
+
+    list(APPEND CSHARP_INSTALL_TARGETS csharp-nvdecode-probe csharp-direct-heicprobe)
 endif()
 
 install(TARGETS ${CSHARP_INSTALL_TARGETS} RUNTIME DESTINATION bin)
