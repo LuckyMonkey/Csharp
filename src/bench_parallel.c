@@ -288,7 +288,16 @@ int main(int argc, char **argv)
 
     csharp_nvdec_set_verbose(0);
     csharp_nvdec_set_backend(backend);
-    err = direct_backend ? csharp_register_direct_nvdec_plugin() : csharp_register_nvdec_plugin();
+    if (direct_backend) {
+#ifdef CSHARP_HAVE_DIRECT_NVDEC
+        err = csharp_register_direct_nvdec_plugin();
+#else
+        fputs("direct backend was not built; configure with CSHARP_ENABLE_DIRECT_NVDEC=ON\n", stderr);
+        goto cleanup;
+#endif
+    } else {
+        err = csharp_register_nvdec_plugin();
+    }
     if (err.code != heif_error_Ok) {
         fprintf(stderr, "cannot register NVDEC plugin: %s\n", err.message ? err.message : "unknown error");
         goto cleanup;

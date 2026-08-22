@@ -13,6 +13,20 @@ pkg_check_modules(LIBHEIF REQUIRED IMPORTED_TARGET libheif)
 pkg_check_modules(LIBAVCODEC REQUIRED IMPORTED_TARGET libavcodec)
 pkg_check_modules(LIBAVUTIL REQUIRED IMPORTED_TARGET libavutil)
 pkg_check_modules(LIBSWSCALE REQUIRED IMPORTED_TARGET libswscale)
+pkg_check_modules(LIBJPEG REQUIRED IMPORTED_TARGET libjpeg)
+
+add_executable(csharp
+    src/csharp.c
+)
+target_link_libraries(csharp PRIVATE
+    PkgConfig::LIBHEIF
+    PkgConfig::LIBJPEG
+)
+target_compile_options(csharp PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
 
 add_executable(heicprobe
     src/heicprobe.c
@@ -49,7 +63,7 @@ target_compile_options(csharp-bench-parallel PRIVATE
     -Wpedantic
 )
 
-set(CSHARP_INSTALL_TARGETS heicprobe csharp-bench-parallel)
+set(CSHARP_INSTALL_TARGETS csharp heicprobe csharp-bench-parallel)
 
 if(CSHARP_ENABLE_DIRECT_NVDEC)
     find_path(NVCUVID_INCLUDE_DIR nvcuvid.h
@@ -141,6 +155,15 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
     )
     target_link_libraries(csharp-bench-parallel PRIVATE csharp-direct-nvdecode)
     target_compile_definitions(csharp-bench-parallel PRIVATE CSHARP_HAVE_DIRECT_NVDEC=1)
+
+    target_sources(csharp PRIVATE src/direct_nvdec_plugin.c)
+    target_include_directories(csharp SYSTEM PRIVATE
+        ${NVCUVID_INCLUDE_DIR}
+        ${CUDA_DRIVER_INCLUDE_DIR}
+    )
+    target_link_libraries(csharp PRIVATE csharp-direct-nvdecode Threads::Threads)
+    target_compile_definitions(csharp PRIVATE CSHARP_HAVE_DIRECT_NVDEC=1)
+    target_compile_options(csharp PRIVATE -Werror)
 
     add_library(csharp-nvcuvid-trace SHARED
         src/nvcuvid_trace.c

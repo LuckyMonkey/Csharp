@@ -48,7 +48,7 @@ Requires CMake, a C compiler, `pkg-config`, libheif development headers, and
 FFmpeg development libraries:
 
 ```bash
-sudo apt install libheif-dev libavcodec-dev libavutil-dev libswscale-dev
+sudo apt install libheif-dev libjpeg-dev libavcodec-dev libavutil-dev libswscale-dev
 ```
 
 ```bash
@@ -56,6 +56,22 @@ cmake -S . -B build
 cmake --build build -j
 ./build/heicprobe image.heic
 ```
+
+The v0.1 single-file converter uses libjpeg-turbo/libjpeg's raw YCbCr API
+and writes through a temporary sibling before the final rename:
+
+```bash
+./build/csharp --backend direct --quality 90 input.heic output.jpg
+./build/csharp --backend cpu --overwrite input.heic output.jpg
+```
+
+The direct converter supports ordinary opaque 8-bit 4:2:0 HEIC stills. It
+copies supported EXIF, XMP, and ICC data, normalizes EXIF orientation because
+libheif supplies display-oriented pixels, refuses an existing destination
+unless `--overwrite` is supplied, and rejects unsupported alpha, depth,
+auxiliary, bit-depth, or multi-image inputs. Failed conversions remove their
+temporary output. Build with `-DCSHARP_ENABLE_DIRECT_NVDEC=ON` for the direct
+backend; otherwise use `--backend cpu`.
 
 The focused NVDEC proof mode decodes the same disposable image first through
 the normal libheif CPU decoder and then through the registered `csharp-nvdec`
