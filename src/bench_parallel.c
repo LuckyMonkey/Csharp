@@ -18,12 +18,21 @@ struct benchmark_input {
     size_t size;
 };
 
+struct start_gate {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    size_t ready;
+    size_t expected;
+    int go;
+};
+
 struct worker_args {
     const struct benchmark_input *inputs;
     size_t input_count;
     size_t start_index;
     size_t iterations;
     size_t stride;
+    struct start_gate *gate;
     int failed;
 };
 
@@ -95,9 +104,20 @@ cleanup:
     return result;
 }
 
+static void gate_wait(struct start_gate *gate)
+{
+    if (!gate) return;
+    pthread_mutex_lock(&gate->mutex);
+    ++gate->ready;
+    pthread_cond_broadcast(&gate->cond);
+    while (!gate->go) pthread_cond_wait(&gate->cond, &gate->mutex);
+    pthread_mutex_unlock(&gate->mutex);
+}
+
 static void *worker_main(void *opaque)
 {
     struct worker_args *args = opaque;
+    gate_wait(args->gate);
 
     for (size_t i = 0; i < args->iterations; ++i) {
         size_t global = args->start_index + i * args->stride;
@@ -109,31 +129,126 @@ static void *worker_main(void *opaque)
     return NULL;
 }
 
+static int run_parallel(const struct benchmark_input *inputs, size_t input_count,
+                        size_t workers, size_t iterations,
+                        double *wall_out, double *cpu_out)
+{
+    struct worker_args *args = calloc(workers, sizeof(*args));
+    pthread_t *threads = calloc(workers, sizeof(*threads));
+    struct start_gate gate;
+    double wall_start, cpu_start;
+    size_t created = 0;
+    int failed = 0;
+
+    if (!args || !threads) { free(args); free(threads); return -1; }
+    memset(&gate, 0, sizeof(gate));
+    gate.expected = workers;
+    pthread_mutex_init(&gate.mutex, NULL);
+    pthread_cond_init(&gate.cond, NULL);
+
+    for (size_t w = 0; w < workers; ++w) {
+        args[w].inputs = inputs;
+        args[w].input_count = input_count;
+        args[w].start_index = w;
+        args[w].stride = workers;
+        args[w].iterations = iterations / workers + (w < iterations % workers ? 1 : 0);
+        args[w].gate = &gate;
+        if (pthread_create(&threads[w], NULL, worker_main, &args[w]) != 0) {
+            failed = 1;
+            break;
+        }
+        ++created;
+    }
+
+    pthread_mutex_lock(&gate.mutex);
+    while (!failed && gate.ready < created) pthread_cond_wait(&gate.cond, &gate.mutex);
+    wall_start = monotonic_seconds();
+    cpu_start = process_cpu_seconds();
+    gate.go = 1;
+    pthread_cond_broadcast(&gate.cond);
+    pthread_mutex_unlock(&gate.mutex);
+
+    for (size_t w = 0; w < created; ++w) pthread_join(threads[w], NULL);
+    if (wall_out) *wall_out = monotonic_seconds() - wall_start;
+    if (cpu_out) *cpu_out = process_cpu_seconds() - cpu_start;
+
+    for (size_t w = 0; w < created; ++w) if (args[w].failed) failed = 1;
+    pthread_cond_destroy(&gate.cond);
+    pthread_mutex_destroy(&gate.mutex);
+    free(threads);
+    free(args);
+    return failed ? -1 : 0;
+}
+
+static void print_stage_stats(const struct csharp_nvdec_stats *s)
+{
+    double n = s->decodes ? (double)s->decodes : 1.0;
+    printf("Stages: decodes=%lu acquire=%.3f annexb=%.3f decode=%.3f transfer=%.3f output=%.3f total=%.3f ms/image\n",
+           s->decodes, s->acquire_ms / n, s->annexb_ms / n,
+           s->decode_ms / n, s->transfer_ms / n,
+           s->output_ms / n, s->total_ms / n);
+    printf("NVDEC counts: CUDA=%lu AVCodecContext=%lu reuses=%lu\n",
+           s->cuda_device_initializations, s->decoder_initializations, s->decoder_reuses);
+}
+
+static int parse_backend(const char *name, enum csharp_nvdec_backend *backend)
+{
+    if (strcmp(name, "cuvid") == 0) *backend = CSHARP_NVDEC_BACKEND_CUVID;
+    else if (strcmp(name, "native") == 0) *backend = CSHARP_NVDEC_BACKEND_NATIVE;
+    else if (strcmp(name, "auto") == 0) *backend = CSHARP_NVDEC_BACKEND_AUTO;
+    else return -1;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct benchmark_input *inputs = NULL;
-    struct worker_args *args = NULL;
-    pthread_t *threads = NULL;
-    char *end = NULL;
+    enum csharp_nvdec_backend backend = CSHARP_NVDEC_BACKEND_CUVID;
+    unsigned repeats = 1;
     unsigned long requested_workers;
     unsigned long long requested_iterations;
-    size_t workers, iterations;
-    double wall_start, cpu_start, wall, cpu;
+    size_t workers, iterations, input_count;
     struct heif_error err;
+    int argi = 1;
     int result = EXIT_FAILURE;
+    char *end;
 
-    if (argc < 5) {
-        fprintf(stderr, "usage: %s <workers> <iterations> <file...>\n", argv[0]);
+    while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
+        if (strcmp(argv[argi], "--backend") == 0 && argi + 1 < argc) {
+            if (parse_backend(argv[argi + 1], &backend) != 0) {
+                fputs("backend must be cuvid, native, or auto\n", stderr);
+                return EXIT_FAILURE;
+            }
+            argi += 2;
+        } else if (strcmp(argv[argi], "--repeats") == 0 && argi + 1 < argc) {
+            unsigned long value;
+            end = NULL;
+            value = strtoul(argv[argi + 1], &end, 10);
+            if (!end || *end != '\0' || value < 1 || value > 20) {
+                fputs("repeats must be in range 1..20\n", stderr);
+                return EXIT_FAILURE;
+            }
+            repeats = (unsigned)value;
+            argi += 2;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", argv[argi]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (argc - argi < 3) {
+        fprintf(stderr, "usage: %s [--backend cuvid|native|auto] [--repeats N] <workers> <iterations> <file...>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    requested_workers = strtoul(argv[1], &end, 10);
-    if (!end || *end != '\0' || requested_workers < 1 || requested_workers > 32) {
-        fputs("workers must be in range 1..32\n", stderr);
+    end = NULL;
+    requested_workers = strtoul(argv[argi++], &end, 10);
+    if (!end || *end != '\0' || requested_workers < 1 || requested_workers > 64) {
+        fputs("workers must be in range 1..64\n", stderr);
         return EXIT_FAILURE;
     }
     end = NULL;
-    requested_iterations = strtoull(argv[2], &end, 10);
+    requested_iterations = strtoull(argv[argi++], &end, 10);
     if (!end || *end != '\0' || requested_iterations < 1) {
         fputs("iterations must be >= 1\n", stderr);
         return EXIT_FAILURE;
@@ -141,74 +256,59 @@ int main(int argc, char **argv)
 
     workers = (size_t)requested_workers;
     iterations = (size_t)requested_iterations;
-    inputs = calloc((size_t)(argc - 3), sizeof(*inputs));
-    args = calloc(workers, sizeof(*args));
-    threads = calloc(workers, sizeof(*threads));
-    if (!inputs || !args || !threads) goto cleanup;
+    input_count = (size_t)(argc - argi);
+    inputs = calloc(input_count, sizeof(*inputs));
+    if (!inputs) return EXIT_FAILURE;
 
-    for (int i = 3; i < argc; ++i) {
-        if (load_input(argv[i], &inputs[i - 3]) != 0) {
-            fprintf(stderr, "cannot load input: %s\n", argv[i]);
+    for (size_t i = 0; i < input_count; ++i) {
+        if (load_input(argv[argi + (int)i], &inputs[i]) != 0) {
+            fprintf(stderr, "cannot load input: %s\n", argv[argi + (int)i]);
             goto cleanup;
         }
     }
 
     csharp_nvdec_set_verbose(0);
-    csharp_nvdec_reset_stats();
+    csharp_nvdec_set_backend(backend);
     err = csharp_register_nvdec_plugin();
     if (err.code != heif_error_Ok) {
         fprintf(stderr, "cannot register NVDEC plugin: %s\n", err.message ? err.message : "unknown error");
         goto cleanup;
     }
 
-    /* Pay cold-start once before the timed region. */
-    if (decode_input(&inputs[0]) != 0) {
-        fputs("NVDEC warm-up failed\n", stderr);
-        goto cleanup;
-    }
+    printf("Backend=%s workers=%zu iterations=%zu inputs=%zu repeats=%u\n",
+           csharp_nvdec_backend_name(backend), workers, iterations, input_count, repeats);
 
-    for (size_t w = 0; w < workers; ++w) {
-        args[w].inputs = inputs;
-        args[w].input_count = (size_t)(argc - 3);
-        args[w].start_index = w;
-        args[w].stride = workers;
-        args[w].iterations = iterations / workers + (w < iterations % workers ? 1 : 0);
-    }
-
-    wall_start = monotonic_seconds();
-    cpu_start = process_cpu_seconds();
-    for (size_t w = 0; w < workers; ++w) {
-        if (pthread_create(&threads[w], NULL, worker_main, &args[w]) != 0) {
-            fputs("pthread_create failed\n", stderr);
+    /* Prewarm all lanes concurrently, not merely input zero. This intentionally
+     * preserves worker/input affinity from the measured run and populates enough
+     * decoder contexts before timing begins. */
+    {
+        size_t warm_iterations = workers;
+        if (warm_iterations < input_count) warm_iterations = input_count;
+        if (run_parallel(inputs, input_count, workers, warm_iterations, NULL, NULL) != 0) {
+            fputs("NVDEC multi-lane prewarm failed\n", stderr);
             goto cleanup;
         }
     }
-    for (size_t w = 0; w < workers; ++w) pthread_join(threads[w], NULL);
-    wall = monotonic_seconds() - wall_start;
-    cpu = process_cpu_seconds() - cpu_start;
 
-    for (size_t w = 0; w < workers; ++w) {
-        if (args[w].failed) {
+    for (unsigned r = 0; r < repeats; ++r) {
+        double wall = 0.0, cpu = 0.0;
+        struct csharp_nvdec_stats stats;
+        csharp_nvdec_reset_stats();
+        if (run_parallel(inputs, input_count, workers, iterations, &wall, &cpu) != 0) {
             fputs("parallel decode failed\n", stderr);
             goto cleanup;
         }
+        csharp_nvdec_get_stats(&stats);
+        printf("Run %u: wall=%.6f sec cpu=%.6f sec images/sec=%.2f cpu-ms/image=%.3f avg-cpu-cores=%.2f\n",
+               r + 1, wall, cpu, (double)iterations / wall,
+               cpu * 1000.0 / (double)iterations, wall > 0.0 ? cpu / wall : 0.0);
+        print_stage_stats(&stats);
     }
 
-    printf("NVDEC parallel: workers=%zu iterations=%zu wall=%.6f sec cpu=%.6f sec images/sec=%.2f cpu-ms/image=%.3f avg-cpu-cores=%.2f\n",
-           workers, iterations, wall, cpu, (double)iterations / wall,
-           cpu * 1000.0 / (double)iterations, wall > 0.0 ? cpu / wall : 0.0);
-    printf("NVDEC counts: CUDA=%lu AVCodecContext=%lu reuses=%lu\n",
-           csharp_nvdec_cuda_device_initializations(),
-           csharp_nvdec_decoder_initializations(),
-           csharp_nvdec_decoder_reuses());
     result = EXIT_SUCCESS;
 
 cleanup:
-    if (inputs) {
-        for (int i = 3; i < argc; ++i) free(inputs[i - 3].data);
-    }
-    free(threads);
-    free(args);
+    if (inputs) for (size_t i = 0; i < input_count; ++i) free(inputs[i].data);
     free(inputs);
     return result;
 }
