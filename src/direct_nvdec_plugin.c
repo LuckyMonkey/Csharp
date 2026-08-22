@@ -2,6 +2,7 @@
 
 #include "direct_nvdec_plugin.h"
 #include "direct_nvdec_memory.h"
+#include "direct_nvdec_timing.h"
 
 #include <cuda.h>
 #include <nvcuvid.h>
@@ -139,6 +140,12 @@ static void direct_trace(struct direct_decoder *decoder, const char *event, ...)
     fputc('\n', stderr);
 }
 
+static void direct_timing_record(enum csharp_direct_stage stage, uint64_t start)
+{
+    uint64_t end = csharp_direct_now_ns();
+    if (end >= start) csharp_direct_timing_add(stage, end - start);
+}
+
 static void lock_lanes(void)
 {
     (void)pthread_mutex_lock(&direct_lane_lock);
@@ -161,6 +168,12 @@ static unsigned int active_lane_limit(void)
     return (unsigned int)parsed;
 }
 
+static unsigned long output_surface_count(void)
+{
+    const char *value = getenv("CSHARP_DIRECT_OUTPUT_SURFACES");
+    return value && strcmp(value, "1") == 0 ? 1UL : 2UL;
+}
+
 static void destroy_lane(struct direct_decoder *decoder)
 {
     if (!decoder) return;
@@ -181,6 +194,7 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
     struct csharp_nvdec_memory_snapshot memory_before;
     struct csharp_nvdec_memory_snapshot memory_after;
     unsigned int surfaces;
+    unsigned long output_surfaces;
     int needs_create;
 
     if (!decoder || !format || format->codec != cudaVideoCodec_HEVC ||
@@ -219,6 +233,7 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
     surfaces = format->min_num_decode_surfaces;
     if (surfaces < 2) surfaces = 2;
     if (surfaces > 16) surfaces = 16;
+    output_surfaces = output_surface_count();
 
     bucket = csharp_nvdec_geometry_bucket(format->coded_width, format->coded_height);
     needs_create = !decoder->decoder_created ||
@@ -262,7 +277,7 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
     info.DeinterlaceMode = cudaVideoDeinterlaceMode_Weave;
     info.ulTargetWidth = format->coded_width;
     info.ulTargetHeight = format->coded_height;
-    info.ulNumOutputSurfaces = 2;
+    info.ulNumOutputSurfaces = output_surfaces;
 
     if (decoder->decoder_created) {
         CUVIDRECONFIGUREDECODERINFO reconfigure;
@@ -560,6 +575,7 @@ static struct heif_error make_image(struct direct_decoder *decoder,
     int chroma_height;
     size_t uv_row_bytes;
     size_t uv_bytes;
+    uint64_t start;
 
     if (getenv("CSHARP_DIRECT_GEOMETRY_DEBUG")) {
         fprintf(stderr, "direct mapped pitch=%u output=%dx%d luma_crop=(%d,%d %dx%d) chroma_crop=(%d,%d %dx%d)\n",
@@ -570,6 +586,7 @@ static struct heif_error make_image(struct direct_decoder *decoder,
                 (decoder->display_width + 1) / 2, (decoder->display_height + 1) / 2);
     }
 
+    start = csharp_direct_now_ns();
     err = heif_image_create(decoder->display_width, decoder->display_height,
                             heif_colorspace_YCbCr, heif_chroma_420, out_image);
     if (err.code != heif_error_Ok) return err;
@@ -590,6 +607,7 @@ static struct heif_error make_image(struct direct_decoder *decoder,
     if (!y || !cb || !cr) return direct_error(heif_error_Decoder_plugin_error,
                                               heif_suberror_Unspecified,
                                               "cannot access direct output planes");
+    direct_timing_record(CSHARP_DIRECT_STAGE_OUTPUT, start);
     if (getenv("CSHARP_DIRECT_GEOMETRY_DEBUG")) {
         fprintf(stderr, "direct heif strides Y=%d Cb=%d Cr=%d dimensions=%dx%d chroma=%dx%d\n",
                 y_stride, cb_stride, cr_stride, decoder->display_width,
@@ -608,11 +626,13 @@ static struct heif_error make_image(struct direct_decoder *decoder,
     copy.dstPitch = (size_t)y_stride;
     copy.WidthInBytes = (size_t)decoder->display_width;
     copy.Height = (size_t)decoder->display_height;
+    start = csharp_direct_now_ns();
     if (!cuda_ok(cuMemcpy2D(&copy))) {
         return direct_error(heif_error_Decoder_plugin_error,
                             heif_suberror_Unspecified,
                             "Y surface bulk copy failed");
     }
+    direct_timing_record(CSHARP_DIRECT_STAGE_COPY_Y, start);
 
     /*
      * NV12 chroma is interleaved UV. Copy the complete visible chroma
@@ -648,21 +668,26 @@ static struct heif_error make_image(struct direct_decoder *decoder,
     copy.dstPitch = uv_row_bytes;
     copy.WidthInBytes = uv_row_bytes;
     copy.Height = (size_t)chroma_height;
+    start = csharp_direct_now_ns();
     if (!cuda_ok(cuMemcpy2D(&copy))) {
         return direct_error(heif_error_Decoder_plugin_error,
                             heif_suberror_Unspecified,
                             "UV surface bulk copy failed");
     }
+    direct_timing_record(CSHARP_DIRECT_STAGE_COPY_UV, start);
 
+    start = csharp_direct_now_ns();
+    start = csharp_direct_now_ns();
     for (int row = 0; row < chroma_height; ++row) {
         const uint8_t *src = decoder->uv_staging + (size_t)row * uv_row_bytes;
         uint8_t *dst_cb = cb + (size_t)row * (size_t)cb_stride;
         uint8_t *dst_cr = cr + (size_t)row * (size_t)cr_stride;
         for (int col = 0; col < chroma_width; ++col) {
-            dst_cb[col] = src[(size_t)col * 2U];
-            dst_cr[col] = src[(size_t)col * 2U + 1U];
+            *dst_cb++ = *src++;
+            *dst_cr++ = *src++;
         }
     }
+    direct_timing_record(CSHARP_DIRECT_STAGE_DEINTERLEAVE, start);
 
     return direct_ok();
 }
@@ -680,6 +705,8 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
     CUcontext previous = NULL;
     int context_pushed = 0;
     struct heif_error err = direct_ok();
+    uint64_t total_start = csharp_direct_now_ns();
+    uint64_t start;
 
     if (!decoder || !out_image || !decoder->input_size) {
         return direct_error(heif_error_Invalid_input, heif_suberror_No_item_data,
@@ -691,12 +718,14 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
                             "CUDA context activation failed");
     }
     context_pushed = 1;
+    start = csharp_direct_now_ns();
     if (length_prefixed_to_annexb(decoder->input, decoder->input_size,
                                   &annexb, &annexb_size) != 0) {
         err = direct_error(heif_error_Invalid_input, heif_suberror_End_of_data,
                            "invalid length-prefixed HEVC stream");
         goto cleanup;
     }
+    direct_timing_record(CSHARP_DIRECT_STAGE_ANNEXB, start);
     memset(&packet, 0, sizeof(packet));
     packet.flags = CUVID_PKT_TIMESTAMP | CUVID_PKT_ENDOFPICTURE;
     if (decoder->has_decoded) packet.flags |= CUVID_PKT_DISCONTINUITY;
@@ -707,7 +736,9 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
     direct_trace(decoder, "packet flags=0x%lx bytes=%lu timestamp=%lld",
                  packet.flags, packet.payload_size, (long long)packet.timestamp);
     {
+        start = csharp_direct_now_ns();
         CUresult result = cuvidParseVideoData(decoder->parser, &packet);
+        direct_timing_record(CSHARP_DIRECT_STAGE_PARSE, start);
         direct_trace(decoder, "parse packet result=%d(%s)", (int)result, cuda_name(result));
         if (!cuda_ok(result)) {
             err = direct_error(heif_error_Decoder_plugin_error, heif_suberror_Unspecified,
@@ -719,7 +750,9 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
     memset(&eos, 0, sizeof(eos));
     eos.flags = CUVID_PKT_ENDOFSTREAM | CUVID_PKT_NOTIFY_EOS;
     {
+        start = csharp_direct_now_ns();
         CUresult result = cuvidParseVideoData(decoder->parser, &eos);
+        direct_timing_record(CSHARP_DIRECT_STAGE_FLUSH_WAIT, start);
         direct_trace(decoder, "parse eos result=%d(%s) display_ready=%d",
                      (int)result, cuda_name(result), decoder->display_ready);
         if (!cuda_ok(result) || !decoder->display_ready) {
@@ -731,8 +764,10 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
     memset(&proc, 0, sizeof(proc));
     proc.progressive_frame = 1;
     {
+        start = csharp_direct_now_ns();
         CUresult result = cuvidMapVideoFrame(decoder->decoder, decoder->display_index,
                                               &mapped, &pitch, &proc);
+        direct_timing_record(CSHARP_DIRECT_STAGE_MAP, start);
         direct_trace(decoder, "map picture=%d result=%d(%s) pitch=%u",
                      decoder->display_index, (int)result, cuda_name(result), pitch);
         if (!cuda_ok(result)) {
@@ -743,7 +778,9 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
     }
     err = make_image(decoder, mapped, pitch, out_image);
     {
+        start = csharp_direct_now_ns();
         CUresult result = cuvidUnmapVideoFrame(decoder->decoder, mapped);
+        direct_timing_record(CSHARP_DIRECT_STAGE_UNMAP, start);
         direct_trace(decoder, "unmap result=%d(%s)", (int)result, cuda_name(result));
         if (!cuda_ok(result) && err.code == heif_error_Ok) {
         err = direct_error(heif_error_Decoder_plugin_error, heif_suberror_Unspecified,
@@ -761,6 +798,7 @@ cleanup:
     }
     if (err.code == heif_error_Ok) {
         atomic_fetch_add_explicit(&direct_decodes, 1, memory_order_relaxed);
+        direct_timing_record(CSHARP_DIRECT_STAGE_TOTAL, total_start);
     }
     return err;
 }

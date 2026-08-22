@@ -5,6 +5,7 @@
 #include "nvdec_plugin.h"
 #ifdef CSHARP_HAVE_DIRECT_NVDEC
 #include "direct_nvdec_plugin.h"
+#include "direct_nvdec_timing.h"
 #endif
 
 #include <pthread.h>
@@ -318,6 +319,7 @@ int main(int argc, char **argv)
         if (direct_backend) {
 #ifdef CSHARP_HAVE_DIRECT_NVDEC
             csharp_direct_nvdec_reset_stats();
+            csharp_direct_timing_reset();
 #endif
         } else {
             csharp_nvdec_reset_stats();
@@ -331,11 +333,27 @@ int main(int argc, char **argv)
                cpu * 1000.0 / (double)iterations, wall > 0.0 ? cpu / wall : 0.0);
         if (direct_backend) {
 #ifdef CSHARP_HAVE_DIRECT_NVDEC
+            struct csharp_direct_timing_snapshot timing;
             csharp_direct_nvdec_get_stats(&direct_stats);
             printf("Direct counts: decodes=%lu lane_creates=%lu lane_reuses=%lu decoder_creates=%lu reconfigures=%lu bucket_grows=%lu\n",
                    direct_stats.decodes, direct_stats.lane_creates, direct_stats.lane_reuses,
                    direct_stats.decoder_creates, direct_stats.decoder_reconfigures,
                    direct_stats.decoder_bucket_grows);
+            csharp_direct_timing_get(&timing);
+            printf("Direct stages: annexb=%.4f parse=%.4f flush_wait=%.4f map=%.4f "
+                   "copy_y=%.4f copy_uv=%.4f deinterleave=%.4f output=%.4f "
+                   "unmap=%.4f total=%.4f ms/image samples=%llu\n",
+                   csharp_direct_stage_ms_per_sample(&timing, CSHARP_DIRECT_STAGE_ANNEXB),
+                   csharp_direct_stage_ms_per_sample(&timing, CSHARP_DIRECT_STAGE_PARSE),
+                   csharp_direct_stage_ms_per_sample(&timing, CSHARP_DIRECT_STAGE_FLUSH_WAIT),
+                   csharp_direct_stage_ms_per_sample(&timing, CSHARP_DIRECT_STAGE_MAP),
+                   csharp_direct_stage_ms_per_sample(&timing, CSHARP_DIRECT_STAGE_COPY_Y),
+                   csharp_direct_stage_ms_per_sample(&timing, CSHARP_DIRECT_STAGE_COPY_UV),
+                   csharp_direct_stage_ms_per_sample(&timing, CSHARP_DIRECT_STAGE_DEINTERLEAVE),
+                   csharp_direct_stage_ms_per_sample(&timing, CSHARP_DIRECT_STAGE_OUTPUT),
+                   csharp_direct_stage_ms_per_sample(&timing, CSHARP_DIRECT_STAGE_UNMAP),
+                   csharp_direct_stage_ms_per_sample(&timing, CSHARP_DIRECT_STAGE_TOTAL),
+                   (unsigned long long)timing.samples[CSHARP_DIRECT_STAGE_TOTAL]);
 #endif
         } else {
             csharp_nvdec_get_stats(&stats);
