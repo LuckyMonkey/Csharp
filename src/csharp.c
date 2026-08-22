@@ -301,14 +301,12 @@ static int supported_input(struct heif_context *ctx, struct heif_image_handle *h
                 bits, chroma_bits);
         return -1;
     }
-    if (heif_image_handle_has_alpha_channel(handle) ||
-        heif_image_handle_has_depth_image(handle) ||
-        heif_image_handle_get_number_of_auxiliary_images(handle, 0) > 0) {
-        fputs("csharp: unsupported alpha, depth, or auxiliary image\n", stderr);
+    if (heif_image_handle_has_alpha_channel(handle)) {
+        fputs("csharp: unsupported primary alpha channel (JPEG v0.1 is opaque)\n", stderr);
         return -1;
     }
-    if (heif_context_get_number_of_top_level_images(ctx) != 1) {
-        fputs("csharp: v0.1 requires exactly one top-level image\n", stderr);
+    if (heif_context_get_number_of_top_level_images(ctx) < 1) {
+        fputs("csharp: input contains no top-level image\n", stderr);
         return -1;
     }
     if (heif_image_handle_get_preferred_decoding_colorspace(handle, &colorspace, &chroma).code != heif_error_Ok ||
