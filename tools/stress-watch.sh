@@ -55,7 +55,7 @@ samples="$work_dir/resources.tsv"
 runlog="$work_dir/harness.log"
 printf 'epoch\tpid\trss_kib\tfds\tgpu_mem_mib\tgpu_util_pct\tdecoder_util_pct\n' > "$samples"
 
-"$root/tests/corpus-regression.sh" \
+bash "$root/tests/corpus-regression.sh" \
   --binary "$binary" --backend "$backend" --repeat "$repeat" \
   --work-dir "$work_dir/regression" --keep "$input" >"$runlog" 2>&1 &
 harness_pid=$!
