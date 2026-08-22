@@ -461,7 +461,7 @@ static struct heif_error decode_image(void *raw_decoder, struct heif_image **out
     AVPacket packet = {0};
     AVFrame *decoded = NULL;
     AVFrame *downloaded = NULL;
-    uint64_t t0, t1, t2, t3, t4, t5;
+    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
     int ret;
     struct heif_error err = ok_error();
 
@@ -471,6 +471,7 @@ static struct heif_error decode_image(void *raw_decoder, struct heif_image **out
     }
     *out_image = NULL;
     t0 = now_ns();
+    t1 = t0;
 
     t1 = now_ns();
     if (acquire_codec(decoder) < 0) {
@@ -546,8 +547,8 @@ static struct heif_error decode_image(void *raw_decoder, struct heif_image **out
 cleanup:
     {
         uint64_t end = now_ns();
-        atomic_fetch_add_explicit(&acquire_ns, t2 - t1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&annexb_ns, t3 - t2, memory_order_relaxed);
+        if (t2 >= t1) atomic_fetch_add_explicit(&acquire_ns, t2 - t1, memory_order_relaxed);
+        if (t3 >= t2) atomic_fetch_add_explicit(&annexb_ns, t3 - t2, memory_order_relaxed);
         if (t4 >= t3) atomic_fetch_add_explicit(&decode_ns, t4 - t3, memory_order_relaxed);
         if (t5 >= t4) atomic_fetch_add_explicit(&transfer_ns, t5 - t4, memory_order_relaxed);
         if (end >= t5) atomic_fetch_add_explicit(&output_ns, end - t5, memory_order_relaxed);
