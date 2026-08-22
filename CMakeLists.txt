@@ -6,6 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(LIBHEIF REQUIRED IMPORTED_TARGET libheif)
 pkg_check_modules(LIBAVCODEC REQUIRED IMPORTED_TARGET libavcodec)
 pkg_check_modules(LIBAVUTIL REQUIRED IMPORTED_TARGET libavutil)
@@ -23,10 +24,27 @@ target_link_libraries(heicprobe PRIVATE
     PkgConfig::LIBSWSCALE
 )
 
+add_executable(csharp-bench-parallel
+    src/bench_parallel.c
+    src/nvdec_plugin.c
+)
+target_link_libraries(csharp-bench-parallel PRIVATE
+    PkgConfig::LIBHEIF
+    PkgConfig::LIBAVCODEC
+    PkgConfig::LIBAVUTIL
+    PkgConfig::LIBSWSCALE
+    Threads::Threads
+)
+
 target_compile_options(heicprobe PRIVATE
     -Wall
     -Wextra
     -Wpedantic
 )
+target_compile_options(csharp-bench-parallel PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
 
-install(TARGETS heicprobe RUNTIME DESTINATION bin)
+install(TARGETS heicprobe csharp-bench-parallel RUNTIME DESTINATION bin)
