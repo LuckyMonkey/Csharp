@@ -474,6 +474,7 @@ static int convert_file(const char *input, const char *output, int overwrite,
     report.selected_decode_path = "unknown";
     report.error_stage = "none";
     report.quality = quality;
+    report.classification.reason = CSHARP_REASON_NO_IMAGE;
 
     temp[0] = '\0';
 
