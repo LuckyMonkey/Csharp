@@ -34,6 +34,8 @@ struct direct_decoder {
     uint8_t *input;
     size_t input_size;
     size_t input_capacity;
+    uint8_t *uv_staging;
+    size_t uv_staging_capacity;
     int busy;
     int initialized;
     int has_decoded;
@@ -82,6 +84,7 @@ static void destroy_lane(struct direct_decoder *decoder)
     if (decoder->decoder_created) cuvidDestroyDecoder(decoder->decoder);
     if (decoder->context) cuCtxDestroy(decoder->context);
     free(decoder->input);
+    free(decoder->uv_staging);
     memset(decoder, 0, sizeof(*decoder));
     decoder->display_index = -1;
 }
@@ -348,7 +351,19 @@ static int length_prefixed_to_annexb(const uint8_t *input, size_t input_size,
     return 0;
 }
 
-static struct heif_error make_image(const struct direct_decoder *decoder,
+static int ensure_uv_staging(struct direct_decoder *decoder, size_t needed)
+{
+    uint8_t *grown;
+
+    if (needed <= decoder->uv_staging_capacity) return 0;
+    grown = realloc(decoder->uv_staging, needed);
+    if (!grown) return -1;
+    decoder->uv_staging = grown;
+    decoder->uv_staging_capacity = needed;
+    return 0;
+}
+
+static struct heif_error make_image(struct direct_decoder *decoder,
                                     CUdeviceptr mapped, unsigned int pitch,
                                     struct heif_image **out_image)
 {
@@ -359,8 +374,12 @@ static struct heif_error make_image(const struct direct_decoder *decoder,
     int y_stride;
     int cb_stride;
     int cr_stride;
-    CUVIDPROCPARAMS proc;
     CUdeviceptr source;
+    CUDA_MEMCPY2D copy;
+    int chroma_width;
+    int chroma_height;
+    size_t uv_row_bytes;
+    size_t uv_bytes;
 
     if (getenv("CSHARP_DIRECT_GEOMETRY_DEBUG")) {
         fprintf(stderr, "direct mapped pitch=%u output=%dx%d luma_crop=(%d,%d %dx%d) chroma_crop=(%d,%d %dx%d)\n",
@@ -397,45 +416,74 @@ static struct heif_error make_image(const struct direct_decoder *decoder,
                 decoder->display_height, (decoder->display_width + 1) / 2,
                 (decoder->display_height + 1) / 2);
     }
-    memset(&proc, 0, sizeof(proc));
-    proc.progressive_frame = 1;
+
+    /* Copy the complete visible luma rectangle in one driver call. */
     source = mapped + (CUdeviceptr)decoder->display_top * pitch + decoder->display_left;
-    for (int row = 0; row < decoder->display_height; ++row) {
-        CUDA_MEMCPY2D copy = {0};
-        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-        copy.srcDevice = source + (CUdeviceptr)row * pitch;
-        copy.srcPitch = pitch;
-        copy.dstMemoryType = CU_MEMORYTYPE_HOST;
-        copy.dstHost = y + (size_t)row * (size_t)y_stride;
-        copy.dstPitch = (size_t)y_stride;
-        copy.WidthInBytes = (size_t)decoder->display_width;
-        copy.Height = 1;
-        if (!cuda_ok(cuMemcpy2D(&copy))) return direct_error(heif_error_Decoder_plugin_error,
-                                                              heif_suberror_Unspecified,
-                                                              "Y surface copy failed");
+    memset(&copy, 0, sizeof(copy));
+    copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    copy.srcDevice = source;
+    copy.srcPitch = pitch;
+    copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+    copy.dstHost = y;
+    copy.dstPitch = (size_t)y_stride;
+    copy.WidthInBytes = (size_t)decoder->display_width;
+    copy.Height = (size_t)decoder->display_height;
+    if (!cuda_ok(cuMemcpy2D(&copy))) {
+        return direct_error(heif_error_Decoder_plugin_error,
+                            heif_suberror_Unspecified,
+                            "Y surface bulk copy failed");
     }
+
+    /*
+     * NV12 chroma is interleaved UV. Copy the complete visible chroma
+     * rectangle once, then deinterleave it in host memory. This replaces one
+     * CUDA driver call per chroma sample with a single 2D transfer.
+     *
+     * Keep display_left as a byte offset: this intentionally preserves the
+     * exact odd-dimension crop semantics validated against libheif/FFmpeg.
+     */
+    chroma_width = (decoder->display_width + 1) / 2;
+    chroma_height = (decoder->display_height + 1) / 2;
+    uv_row_bytes = (size_t)chroma_width * 2U;
+    if ((size_t)chroma_height > SIZE_MAX / uv_row_bytes) {
+        return direct_error(heif_error_Memory_allocation_error,
+                            heif_suberror_Unspecified,
+                            "UV staging size overflow");
+    }
+    uv_bytes = uv_row_bytes * (size_t)chroma_height;
+    if (ensure_uv_staging(decoder, uv_bytes) != 0) {
+        return direct_error(heif_error_Memory_allocation_error,
+                            heif_suberror_Unspecified,
+                            "UV staging allocation failed");
+    }
+
     source = mapped + (CUdeviceptr)decoder->height * pitch +
              (CUdeviceptr)(decoder->display_top / 2) * pitch + decoder->display_left;
-    for (int row = 0; row < (decoder->display_height + 1) / 2; ++row) {
-        for (int col = 0; col < (decoder->display_width + 1) / 2; ++col) {
-            uint8_t uv[2];
-            CUDA_MEMCPY2D copy = {0};
-            copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-            copy.srcDevice = source + (CUdeviceptr)row * pitch + (CUdeviceptr)col * 2;
-            copy.srcPitch = pitch;
-            copy.dstMemoryType = CU_MEMORYTYPE_HOST;
-            copy.dstHost = uv;
-            copy.dstPitch = 2;
-            copy.WidthInBytes = 2;
-            copy.Height = 1;
-            if (!cuda_ok(cuMemcpy2D(&copy))) return direct_error(heif_error_Decoder_plugin_error,
-                                                                  heif_suberror_Unspecified,
-                                                                  "UV surface copy failed");
-            cb[(size_t)row * (size_t)cb_stride + col] = uv[0];
-            cr[(size_t)row * (size_t)cr_stride + col] = uv[1];
+    memset(&copy, 0, sizeof(copy));
+    copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    copy.srcDevice = source;
+    copy.srcPitch = pitch;
+    copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+    copy.dstHost = decoder->uv_staging;
+    copy.dstPitch = uv_row_bytes;
+    copy.WidthInBytes = uv_row_bytes;
+    copy.Height = (size_t)chroma_height;
+    if (!cuda_ok(cuMemcpy2D(&copy))) {
+        return direct_error(heif_error_Decoder_plugin_error,
+                            heif_suberror_Unspecified,
+                            "UV surface bulk copy failed");
+    }
+
+    for (int row = 0; row < chroma_height; ++row) {
+        const uint8_t *src = decoder->uv_staging + (size_t)row * uv_row_bytes;
+        uint8_t *dst_cb = cb + (size_t)row * (size_t)cb_stride;
+        uint8_t *dst_cr = cr + (size_t)row * (size_t)cr_stride;
+        for (int col = 0; col < chroma_width; ++col) {
+            dst_cb[col] = src[(size_t)col * 2U];
+            dst_cr[col] = src[(size_t)col * 2U + 1U];
         }
     }
-    (void)proc;
+
     return direct_ok();
 }
 
@@ -465,8 +513,9 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
     context_pushed = 1;
     if (length_prefixed_to_annexb(decoder->input, decoder->input_size,
                                   &annexb, &annexb_size) != 0) {
-        return direct_error(heif_error_Invalid_input, heif_suberror_End_of_data,
-                            "invalid length-prefixed HEVC stream");
+        err = direct_error(heif_error_Invalid_input, heif_suberror_End_of_data,
+                           "invalid length-prefixed HEVC stream");
+        goto cleanup;
     }
     memset(&packet, 0, sizeof(packet));
     packet.flags = CUVID_PKT_TIMESTAMP | CUVID_PKT_ENDOFPICTURE;
