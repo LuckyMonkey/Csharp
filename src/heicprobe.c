@@ -137,11 +137,26 @@ struct benchmark_input {
     size_t size;
 };
 
-static double monotonic_seconds(void)
+struct benchmark_timing {
+    double wall_seconds;
+    double cpu_seconds;
+};
+
+static double clock_seconds(clockid_t clock_id)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(clock_id, &ts) != 0) return -1.0;
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static double monotonic_seconds(void)
+{
+    return clock_seconds(CLOCK_MONOTONIC);
+}
+
+static double process_cpu_seconds(void)
+{
+    return clock_seconds(CLOCK_PROCESS_CPUTIME_ID);
 }
 
 static int load_benchmark_input(const char *path, struct benchmark_input *input)
@@ -200,28 +215,41 @@ cleanup:
     return result;
 }
 
-static double benchmark_decodes(const struct benchmark_input *inputs, size_t input_count,
-                                size_t iterations, bool nvdec)
+static struct benchmark_timing benchmark_decodes(const struct benchmark_input *inputs,
+                                                  size_t input_count,
+                                                  size_t iterations, bool nvdec)
 {
-    double start = monotonic_seconds();
+    struct benchmark_timing timing = {-1.0, -1.0};
+    double wall_start = monotonic_seconds();
+    double cpu_start = process_cpu_seconds();
+
+    if (wall_start < 0.0 || cpu_start < 0.0) return timing;
     for (size_t i = 0; i < iterations; ++i) {
-        if (decode_benchmark_input(&inputs[i % input_count], nvdec) != 0) return -1.0;
+        if (decode_benchmark_input(&inputs[i % input_count], nvdec) != 0) return timing;
     }
-    return monotonic_seconds() - start;
+    timing.wall_seconds = monotonic_seconds() - wall_start;
+    timing.cpu_seconds = process_cpu_seconds() - cpu_start;
+    return timing;
 }
 
-static void print_timing(const char *label, double seconds, size_t iterations)
+static void print_timing(const char *label, struct benchmark_timing timing, size_t iterations)
 {
-    printf("%s: total=%.6f seconds ms/image=%.3f images/sec=%.2f\n",
-           label, seconds, seconds * 1000.0 / (double)iterations,
-           (double)iterations / seconds);
+    double cores = timing.wall_seconds > 0.0 ? timing.cpu_seconds / timing.wall_seconds : 0.0;
+    double cpu_ms_per_image = timing.cpu_seconds * 1000.0 / (double)iterations;
+
+    printf("%s: wall=%.6f sec cpu=%.6f sec ms/image=%.3f images/sec=%.2f "
+           "cpu-ms/image=%.3f avg-cpu-cores=%.2f\n",
+           label, timing.wall_seconds, timing.cpu_seconds,
+           timing.wall_seconds * 1000.0 / (double)iterations,
+           (double)iterations / timing.wall_seconds,
+           cpu_ms_per_image, cores);
 }
 
 static int run_benchmark(size_t iterations, int file_count, char **paths)
 {
     struct benchmark_input *inputs = calloc((size_t)file_count, sizeof(*inputs));
     struct heif_error err;
-    double seconds;
+    struct benchmark_timing timing;
     int result = EXIT_FAILURE;
 
     if (!inputs) return EXIT_FAILURE;
@@ -235,34 +263,38 @@ static int run_benchmark(size_t iterations, int file_count, char **paths)
     printf("Benchmark: %zu iterations, %d distinct in-memory inputs (round-robin)\n",
            iterations, file_count);
 
-    seconds = benchmark_decodes(inputs, (size_t)file_count, 1, false);
-    if (seconds < 0.0) { fputs("CPU cold decode failed\n", stderr); goto cleanup; }
-    print_timing("CPU cold", seconds, 1);
+    timing = benchmark_decodes(inputs, (size_t)file_count, 1, false);
+    if (timing.wall_seconds < 0.0) { fputs("CPU cold decode failed\n", stderr); goto cleanup; }
+    print_timing("CPU cold", timing, 1);
     if (decode_benchmark_input(&inputs[0], false) != 0) {
         fputs("CPU warm-up failed\n", stderr); goto cleanup;
     }
-    seconds = benchmark_decodes(inputs, (size_t)file_count, iterations, false);
-    if (seconds < 0.0) { fputs("CPU warm decode failed\n", stderr); goto cleanup; }
-    print_timing("CPU warm", seconds, iterations);
+    timing = benchmark_decodes(inputs, (size_t)file_count, iterations, false);
+    if (timing.wall_seconds < 0.0) { fputs("CPU warm decode failed\n", stderr); goto cleanup; }
+    print_timing("CPU warm", timing, iterations);
 
     csharp_nvdec_reset_stats();
-    seconds = monotonic_seconds();
-    err = csharp_register_nvdec_plugin();
-    if (err.code != heif_error_Ok) {
-        print_heif_error("heicprobe: NVDEC plugin registration failed", err);
-        goto cleanup;
+    {
+        double wall_start = monotonic_seconds();
+        double cpu_start = process_cpu_seconds();
+        err = csharp_register_nvdec_plugin();
+        if (err.code != heif_error_Ok) {
+            print_heif_error("heicprobe: NVDEC plugin registration failed", err);
+            goto cleanup;
+        }
+        if (decode_benchmark_input(&inputs[0], true) != 0) {
+            fputs("NVDEC cold decode failed\n", stderr); goto cleanup;
+        }
+        timing.wall_seconds = monotonic_seconds() - wall_start;
+        timing.cpu_seconds = process_cpu_seconds() - cpu_start;
     }
-    if (decode_benchmark_input(&inputs[0], true) != 0) {
-        fputs("NVDEC cold decode failed\n", stderr); goto cleanup;
-    }
-    seconds = monotonic_seconds() - seconds;
-    print_timing("NVDEC cold (registration + CUDA + decode)", seconds, 1);
+    print_timing("NVDEC cold (registration + CUDA + decode)", timing, 1);
     if (decode_benchmark_input(&inputs[0], true) != 0) {
         fputs("NVDEC warm-up failed\n", stderr); goto cleanup;
     }
-    seconds = benchmark_decodes(inputs, (size_t)file_count, iterations, true);
-    if (seconds < 0.0) { fputs("NVDEC warm decode failed\n", stderr); goto cleanup; }
-    print_timing("NVDEC warm", seconds, iterations);
+    timing = benchmark_decodes(inputs, (size_t)file_count, iterations, true);
+    if (timing.wall_seconds < 0.0) { fputs("NVDEC warm decode failed\n", stderr); goto cleanup; }
+    print_timing("NVDEC warm", timing, iterations);
     printf("NVDEC initialization counts: CUDA devices=%lu AVCodecContext/NVDEC=%lu reuses=%lu\n",
            csharp_nvdec_cuda_device_initializations(),
            csharp_nvdec_decoder_initializations(),
@@ -339,11 +371,6 @@ int main(int argc, char **argv)
     printf("EXIF blocks: %d\n", exif_blocks);
     printf("MIME metadata blocks: %d\n", xmp_blocks);
 
-    /*
-     * Phase-1 fast-path policy is deliberately conservative. This is not yet
-     * proof that NVDEC can consume the coded item; it merely identifies sane
-     * candidates for the next stage.
-     */
     const bool plausible_fast_path =
         width > 0 && height > 0 &&
         width <= 16384 && height <= 16384 &&
