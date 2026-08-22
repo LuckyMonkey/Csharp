@@ -122,4 +122,21 @@ can replace the reference backend.
 
 ## Status
 
-Early experiment. Do not use it as the only conversion path for irreplaceable images yet.
+Validated v0.1 hardening snapshot:
+
+- 48 real iCloud HEICs converted 48/48 with both CPU and direct-request modes.
+- The tested corpus observed 48 direct NVDEC paths and zero decode-failure fallbacks.
+- EXIF, standalone XMP, ICC, and orientation normalization were independently checked;
+  output JPEGs were independently decoded with ImageMagick.
+- A 1,008-conversion CPU lifecycle stress completed 1008/1008 with no invalid JPEGs,
+  temporary-file accumulation, or observed FD/RSS growth.
+- The current corpus does not cover 10-bit, HDR, alpha-primary, grid/tiled, or unusual
+  chroma inputs; those remain explicit fallback/fixture work rather than claims of coverage.
+
+Use `--report PATH` for a one-row TSV conversion result containing the selected path,
+fallback reason, dimensions, source depth/chroma, metadata counts, status, and error stage.
+Use `--no-fallback` when a direct-request test must fail instead of using CPU fallback.
+
+The direct path is suitable for continued v0.1 testing, but the project is not yet a
+drop-in archive migration tool until the missing format fixtures and longer direct-mode
+stress coverage are completed.
