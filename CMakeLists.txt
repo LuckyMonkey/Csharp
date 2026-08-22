@@ -113,6 +113,7 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
         -Wpedantic
         -Werror
     )
+
     target_sources(csharp-bench-parallel PRIVATE src/direct_nvdec_plugin.c)
     target_include_directories(csharp-bench-parallel SYSTEM PRIVATE
         ${NVCUVID_INCLUDE_DIR}
@@ -120,6 +121,27 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
     )
     target_link_libraries(csharp-bench-parallel PRIVATE csharp-direct-nvdecode)
     target_compile_definitions(csharp-bench-parallel PRIVATE CSHARP_HAVE_DIRECT_NVDEC=1)
+
+    add_library(csharp-nvcuvid-trace SHARED
+        src/nvcuvid_trace.c
+    )
+    target_include_directories(csharp-nvcuvid-trace SYSTEM PRIVATE
+        ${NVCUVID_INCLUDE_DIR}
+        ${CUDA_DRIVER_INCLUDE_DIR}
+    )
+    target_link_libraries(csharp-nvcuvid-trace PRIVATE
+        ${CUDA_DRIVER_LIBRARY}
+        ${CMAKE_DL_LIBS}
+        Threads::Threads
+    )
+    target_compile_options(csharp-nvcuvid-trace PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Werror
+    )
+    set_target_properties(csharp-nvcuvid-trace PROPERTIES
+        OUTPUT_NAME "csharp-nvcuvid-trace")
 
     list(APPEND CSHARP_INSTALL_TARGETS csharp-nvdecode-probe csharp-direct-heicprobe)
 endif()
