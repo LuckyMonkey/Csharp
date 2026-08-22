@@ -3,6 +3,9 @@
 #include <libheif/heif.h>
 
 #include "nvdec_plugin.h"
+#ifdef CSHARP_HAVE_DIRECT_NVDEC
+#include "direct_nvdec_plugin.h"
+#endif
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -33,6 +36,7 @@ struct worker_args {
     size_t iterations;
     size_t stride;
     struct start_gate *gate;
+    int direct_backend;
     int failed;
 };
 
@@ -75,7 +79,7 @@ static int load_input(const char *path, struct benchmark_input *input)
     return 0;
 }
 
-static int decode_input(const struct benchmark_input *input)
+static int decode_input(const struct benchmark_input *input, int direct_backend)
 {
     struct heif_context *ctx = NULL;
     struct heif_image_handle *handle = NULL;
@@ -92,7 +96,7 @@ static int decode_input(const struct benchmark_input *input)
     if (err.code != heif_error_Ok || !handle) goto cleanup;
     options = heif_decoding_options_alloc();
     if (!options) goto cleanup;
-    options->decoder_id = "csharp-nvdec";
+    options->decoder_id = direct_backend ? "csharp-direct-nvdec" : "csharp-nvdec";
     err = heif_decode_image(handle, &image, heif_colorspace_YCbCr, heif_chroma_420, options);
     if (err.code == heif_error_Ok) result = 0;
 
@@ -121,7 +125,7 @@ static void *worker_main(void *opaque)
 
     for (size_t i = 0; i < args->iterations; ++i) {
         size_t global = args->start_index + i * args->stride;
-        if (decode_input(&args->inputs[global % args->input_count]) != 0) {
+        if (decode_input(&args->inputs[global % args->input_count], args->direct_backend) != 0) {
             args->failed = 1;
             break;
         }
@@ -131,7 +135,7 @@ static void *worker_main(void *opaque)
 
 static int run_parallel(const struct benchmark_input *inputs, size_t input_count,
                         size_t workers, size_t iterations,
-                        double *wall_out, double *cpu_out)
+                        int direct_backend, double *wall_out, double *cpu_out)
 {
     struct worker_args *args = calloc(workers, sizeof(*args));
     pthread_t *threads = calloc(workers, sizeof(*threads));
@@ -153,6 +157,7 @@ static int run_parallel(const struct benchmark_input *inputs, size_t input_count
         args[w].stride = workers;
         args[w].iterations = iterations / workers + (w < iterations % workers ? 1 : 0);
         args[w].gate = &gate;
+        args[w].direct_backend = direct_backend;
         if (pthread_create(&threads[w], NULL, worker_main, &args[w]) != 0) {
             failed = 1;
             break;
@@ -204,6 +209,7 @@ int main(int argc, char **argv)
 {
     struct benchmark_input *inputs = NULL;
     enum csharp_nvdec_backend backend = CSHARP_NVDEC_BACKEND_CUVID;
+    int direct_backend = 0;
     unsigned repeats = 1;
     unsigned long requested_workers;
     unsigned long long requested_iterations;
@@ -215,8 +221,15 @@ int main(int argc, char **argv)
 
     while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
         if (strcmp(argv[argi], "--backend") == 0 && argi + 1 < argc) {
-            if (parse_backend(argv[argi + 1], &backend) != 0) {
-                fputs("backend must be cuvid, native, or auto\n", stderr);
+            if (strcmp(argv[argi + 1], "direct") == 0) {
+#ifdef CSHARP_HAVE_DIRECT_NVDEC
+                direct_backend = 1;
+#else
+                fputs("direct backend was not built; configure with CSHARP_ENABLE_DIRECT_NVDEC=ON\n", stderr);
+                return EXIT_FAILURE;
+#endif
+            } else if (parse_backend(argv[argi + 1], &backend) != 0) {
+                fputs("backend must be cuvid, native, auto, or direct\n", stderr);
                 return EXIT_FAILURE;
             }
             argi += 2;
@@ -237,7 +250,7 @@ int main(int argc, char **argv)
     }
 
     if (argc - argi < 3) {
-        fprintf(stderr, "usage: %s [--backend cuvid|native|auto] [--repeats N] <workers> <iterations> <file...>\n", argv[0]);
+        fprintf(stderr, "usage: %s [--backend cuvid|native|auto|direct] [--repeats N] <workers> <iterations> <file...>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -269,14 +282,15 @@ int main(int argc, char **argv)
 
     csharp_nvdec_set_verbose(0);
     csharp_nvdec_set_backend(backend);
-    err = csharp_register_nvdec_plugin();
+    err = direct_backend ? csharp_register_direct_nvdec_plugin() : csharp_register_nvdec_plugin();
     if (err.code != heif_error_Ok) {
         fprintf(stderr, "cannot register NVDEC plugin: %s\n", err.message ? err.message : "unknown error");
         goto cleanup;
     }
 
     printf("Backend=%s workers=%zu iterations=%zu inputs=%zu repeats=%u\n",
-           csharp_nvdec_backend_name(backend), workers, iterations, input_count, repeats);
+           direct_backend ? "direct" : csharp_nvdec_backend_name(backend), workers, iterations,
+           input_count, repeats);
 
     /* Prewarm all lanes concurrently, not merely input zero. This intentionally
      * preserves worker/input affinity from the measured run and populates enough
@@ -284,7 +298,7 @@ int main(int argc, char **argv)
     {
         size_t warm_iterations = workers;
         if (warm_iterations < input_count) warm_iterations = input_count;
-        if (run_parallel(inputs, input_count, workers, warm_iterations, NULL, NULL) != 0) {
+        if (run_parallel(inputs, input_count, workers, warm_iterations, direct_backend, NULL, NULL) != 0) {
             fputs("NVDEC multi-lane prewarm failed\n", stderr);
             goto cleanup;
         }
@@ -293,16 +307,34 @@ int main(int argc, char **argv)
     for (unsigned r = 0; r < repeats; ++r) {
         double wall = 0.0, cpu = 0.0;
         struct csharp_nvdec_stats stats;
-        csharp_nvdec_reset_stats();
-        if (run_parallel(inputs, input_count, workers, iterations, &wall, &cpu) != 0) {
+#ifdef CSHARP_HAVE_DIRECT_NVDEC
+        struct csharp_direct_nvdec_stats direct_stats;
+#endif
+        if (direct_backend) {
+#ifdef CSHARP_HAVE_DIRECT_NVDEC
+            csharp_direct_nvdec_reset_stats();
+#endif
+        } else {
+            csharp_nvdec_reset_stats();
+        }
+        if (run_parallel(inputs, input_count, workers, iterations, direct_backend, &wall, &cpu) != 0) {
             fputs("parallel decode failed\n", stderr);
             goto cleanup;
         }
-        csharp_nvdec_get_stats(&stats);
         printf("Run %u: wall=%.6f sec cpu=%.6f sec images/sec=%.2f cpu-ms/image=%.3f avg-cpu-cores=%.2f\n",
                r + 1, wall, cpu, (double)iterations / wall,
                cpu * 1000.0 / (double)iterations, wall > 0.0 ? cpu / wall : 0.0);
-        print_stage_stats(&stats);
+        if (direct_backend) {
+#ifdef CSHARP_HAVE_DIRECT_NVDEC
+            csharp_direct_nvdec_get_stats(&direct_stats);
+            printf("Direct counts: decodes=%lu lane_creates=%lu lane_reuses=%lu decoder_creates=%lu reconfigures=%lu\n",
+                   direct_stats.decodes, direct_stats.lane_creates, direct_stats.lane_reuses,
+                   direct_stats.decoder_creates, direct_stats.decoder_reconfigures);
+#endif
+        } else {
+            csharp_nvdec_get_stats(&stats);
+            print_stage_stats(&stats);
+        }
     }
 
     result = EXIT_SUCCESS;

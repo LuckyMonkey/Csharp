@@ -113,6 +113,13 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
         -Wpedantic
         -Werror
     )
+    target_sources(csharp-bench-parallel PRIVATE src/direct_nvdec_plugin.c)
+    target_include_directories(csharp-bench-parallel SYSTEM PRIVATE
+        ${NVCUVID_INCLUDE_DIR}
+        ${CUDA_DRIVER_INCLUDE_DIR}
+    )
+    target_link_libraries(csharp-bench-parallel PRIVATE csharp-direct-nvdecode)
+    target_compile_definitions(csharp-bench-parallel PRIVATE CSHARP_HAVE_DIRECT_NVDEC=1)
 
     list(APPEND CSHARP_INSTALL_TARGETS csharp-nvdecode-probe csharp-direct-heicprobe)
 endif()
