@@ -85,7 +85,7 @@ static int decode_input(const struct benchmark_input *input, int direct_backend)
     struct heif_image_handle *handle = NULL;
     struct heif_image *image = NULL;
     struct heif_decoding_options *options = NULL;
-    struct heif_error err;
+    struct heif_error err = {heif_error_Ok, heif_suberror_Unspecified, "ok"};
     int result = -1;
 
     ctx = heif_context_alloc();
@@ -101,6 +101,11 @@ static int decode_input(const struct benchmark_input *input, int direct_backend)
     if (err.code == heif_error_Ok) result = 0;
 
 cleanup:
+    if (result != 0 && direct_backend) {
+        fprintf(stderr, "direct decode failed for %s: %s (%d/%d)\n",
+                input->path, err.message ? err.message : "unknown error",
+                (int)err.code, (int)err.subcode);
+    }
     heif_decoding_options_free(options);
     heif_image_release(image);
     heif_image_handle_release(handle);
