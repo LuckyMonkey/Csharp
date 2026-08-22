@@ -41,7 +41,7 @@ int csharp_direct_nvdecode_probe(int device_index, struct csharp_nvdecode_caps *
         return -1;
     }
     if (!cuda_ok(cuDeviceGet(&device, device_index), "cuDeviceGet")) return -1;
-    if (!cuda_ok(cuCtxCreate(&context, CU_CTX_SCHED_AUTO, device), "cuCtxCreate")) return -1;
+    if (!cuda_ok(cuCtxCreate(&context, NULL, CU_CTX_SCHED_AUTO, device), "cuCtxCreate")) return -1;
 
     decode_caps.eCodecType = cudaVideoCodec_HEVC;
     decode_caps.eChromaFormat = cudaVideoChromaFormat_420;

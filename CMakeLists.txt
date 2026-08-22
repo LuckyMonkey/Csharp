@@ -71,7 +71,7 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
     add_library(csharp-direct-nvdecode STATIC
         src/direct_nvdec.c
     )
-    target_include_directories(csharp-direct-nvdecode PRIVATE
+    target_include_directories(csharp-direct-nvdecode SYSTEM PRIVATE
         ${NVCUVID_INCLUDE_DIR}
         ${CUDA_DRIVER_INCLUDE_DIR}
     )
