@@ -27,9 +27,6 @@ struct direct_decoder {
     int display_ready;
     int width;
     int height;
-    int configured_width;
-    int configured_height;
-    unsigned int configured_surfaces;
     int display_left;
     int display_top;
     int display_width;
@@ -171,9 +168,6 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
         decoder->decoder_created = 1;
         atomic_fetch_add_explicit(&direct_decoder_creates, 1, memory_order_relaxed);
     }
-    decoder->configured_width = (int)format->coded_width;
-    decoder->configured_height = (int)format->coded_height;
-    decoder->configured_surfaces = surfaces;
     decoder->sequence_seen = 1;
     return (int)surfaces;
 }
@@ -339,7 +333,10 @@ static int length_prefixed_to_annexb(const uint8_t *input, size_t input_size,
     size_t written = 0;
     size_t nal_count = 0;
     size_t output_size;
-    if (!input || input_size < 4 || !out_data || !out_size) return -1;
+    if (!out_data || !out_size) return -1;
+    *out_data = NULL;
+    *out_size = 0;
+    if (!input || input_size < 4) return -1;
 
     while (pos < input_size) {
         uint32_t nal_size;
