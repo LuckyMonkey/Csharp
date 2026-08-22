@@ -332,9 +332,10 @@ int main(int argc, char **argv)
         if (direct_backend) {
 #ifdef CSHARP_HAVE_DIRECT_NVDEC
             csharp_direct_nvdec_get_stats(&direct_stats);
-            printf("Direct counts: decodes=%lu lane_creates=%lu lane_reuses=%lu decoder_creates=%lu reconfigures=%lu\n",
+            printf("Direct counts: decodes=%lu lane_creates=%lu lane_reuses=%lu decoder_creates=%lu reconfigures=%lu bucket_grows=%lu\n",
                    direct_stats.decodes, direct_stats.lane_creates, direct_stats.lane_reuses,
-                   direct_stats.decoder_creates, direct_stats.decoder_reconfigures);
+                   direct_stats.decoder_creates, direct_stats.decoder_reconfigures,
+                   direct_stats.decoder_bucket_grows);
 #endif
         } else {
             csharp_nvdec_get_stats(&stats);

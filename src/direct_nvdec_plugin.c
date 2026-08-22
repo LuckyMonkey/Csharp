@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "direct_nvdec_plugin.h"
+#include "direct_nvdec_memory.h"
 
 #include <cuda.h>
 #include <nvcuvid.h>
@@ -43,6 +44,9 @@ struct direct_decoder {
     int has_decoded;
     int lane_id;
     CUvideotimestamp next_timestamp;
+    unsigned int configured_max_width;
+    unsigned int configured_max_height;
+    unsigned int configured_surfaces;
 };
 
 static struct direct_decoder direct_lanes[DIRECT_LANE_COUNT];
@@ -53,6 +57,7 @@ static atomic_ulong direct_lane_creates;
 static atomic_ulong direct_lane_reuses;
 static atomic_ulong direct_decoder_creates;
 static atomic_ulong direct_decoder_reconfigures;
+static atomic_ulong direct_decoder_bucket_grows;
 static atomic_ulong direct_decodes;
 
 static struct heif_error direct_error(enum heif_error_code code,
@@ -85,6 +90,38 @@ static int direct_trace_enabled(void)
     return value && *value && *value != '0';
 }
 
+static int direct_memory_trace_enabled(void)
+{
+    const char *trace = getenv("CSHARP_DIRECT_TRACE");
+    const char *memory = getenv("CSHARP_DIRECT_MEMORY_TRACE");
+    return (trace && *trace && *trace != '0') ||
+           (memory && *memory && *memory != '0');
+}
+
+static void trace_memory(struct direct_decoder *decoder, const char *operation,
+                         const struct csharp_nvdec_memory_snapshot *before,
+                         const struct csharp_nvdec_memory_snapshot *after,
+                         unsigned int max_width, unsigned int max_height,
+                         unsigned int surfaces, unsigned long output_surfaces)
+{
+    long long delta = 0;
+    char before_text[32];
+    char after_text[32];
+
+    if (!direct_memory_trace_enabled() || !before || !after) return;
+    delta = (long long)after->free_bytes - (long long)before->free_bytes;
+    fprintf(stderr,
+            "direct-memory: lane=%d op=%s coded=%ux%u max=%ux%u surfaces=%u output=%lu "
+            "free_before=%s free_after=%s delta=%lld bytes\n",
+            decoder ? decoder->lane_id : -1, operation,
+            decoder ? (unsigned int)decoder->width : 0U,
+            decoder ? (unsigned int)decoder->height : 0U,
+            max_width, max_height, surfaces, output_surfaces,
+            csharp_nvdec_format_bytes(before->free_bytes, before_text, sizeof(before_text)),
+            csharp_nvdec_format_bytes(after->free_bytes, after_text, sizeof(after_text)),
+            delta);
+}
+
 static void direct_trace(struct direct_decoder *decoder, const char *event, ...)
 {
     CUcontext current = NULL;
@@ -95,7 +132,7 @@ static void direct_trace(struct direct_decoder *decoder, const char *event, ...)
             decoder ? decoder->lane_id : -1, (unsigned long)pthread_self(),
             decoder ? (void *)decoder->context : NULL, (void *)current,
             decoder ? (void *)decoder->parser : NULL,
-            decoder ? (void *)decoder->decoder : NULL, event);
+            decoder ? (void *)decoder->decoder : NULL);
     va_start(args, event);
     vfprintf(stderr, event, args);
     va_end(args);
@@ -140,7 +177,11 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
 {
     struct direct_decoder *decoder = opaque;
     CUVIDDECODECREATEINFO info;
+    struct csharp_nvdec_geometry_bucket bucket;
+    struct csharp_nvdec_memory_snapshot memory_before;
+    struct csharp_nvdec_memory_snapshot memory_after;
     unsigned int surfaces;
+    int needs_create;
 
     if (!decoder || !format || format->codec != cudaVideoCodec_HEVC ||
         format->chroma_format != cudaVideoChromaFormat_420 ||
@@ -179,6 +220,29 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
     if (surfaces < 2) surfaces = 2;
     if (surfaces > 16) surfaces = 16;
 
+    bucket = csharp_nvdec_geometry_bucket(format->coded_width, format->coded_height);
+    needs_create = !decoder->decoder_created ||
+                   format->coded_width > decoder->configured_max_width ||
+                   format->coded_height > decoder->configured_max_height;
+    if (decoder->decoder_created && needs_create) {
+        CUresult result;
+        direct_trace(decoder, "bucket-grow old-max=%ux%u new-max=%ux%u",
+                     decoder->configured_max_width, decoder->configured_max_height,
+                     bucket.max_width, bucket.max_height);
+        result = cuvidDestroyDecoder(decoder->decoder);
+        if (!cuda_ok(result)) {
+            direct_trace(decoder, "destroy-for-bucket-grow result=%d(%s)",
+                         (int)result, cuda_name(result));
+            return 0;
+        }
+        decoder->decoder = NULL;
+        decoder->decoder_created = 0;
+        decoder->configured_max_width = 0;
+        decoder->configured_max_height = 0;
+        decoder->configured_surfaces = 0;
+        atomic_fetch_add_explicit(&direct_decoder_bucket_grows, 1, memory_order_relaxed);
+    }
+
     memset(&info, 0, sizeof(info));
     info.ulWidth = format->coded_width;
     info.ulHeight = format->coded_height;
@@ -188,8 +252,8 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
     info.ulCreationFlags = cudaVideoCreate_Default;
     info.bitDepthMinus8 = 0;
     info.ulIntraDecodeOnly = 0;
-    info.ulMaxWidth = DIRECT_MAX_WIDTH;
-    info.ulMaxHeight = DIRECT_MAX_HEIGHT;
+    info.ulMaxWidth = bucket.max_width;
+    info.ulMaxHeight = bucket.max_height;
     info.display_area.left = 0;
     info.display_area.top = 0;
     info.display_area.right = (short)format->coded_width;
@@ -202,6 +266,8 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
 
     if (decoder->decoder_created) {
         CUVIDRECONFIGUREDECODERINFO reconfigure;
+        int have_memory_before = direct_memory_trace_enabled() &&
+                                 csharp_nvdec_memory_snapshot(&memory_before) == 0;
         memset(&reconfigure, 0, sizeof(reconfigure));
         reconfigure.ulWidth = format->coded_width;
         reconfigure.ulHeight = format->coded_height;
@@ -217,13 +283,28 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
                      (int)result, cuda_name(result), surfaces);
         if (!cuda_ok(result)) return 0;
         atomic_fetch_add_explicit(&direct_decoder_reconfigures, 1, memory_order_relaxed);
+        if (have_memory_before && csharp_nvdec_memory_snapshot(&memory_after) == 0) {
+            trace_memory(decoder, "reconfigure", &memory_before, &memory_after,
+                         decoder->configured_max_width, decoder->configured_max_height,
+                         surfaces, info.ulNumOutputSurfaces);
+        }
     } else {
+        int have_memory_before = direct_memory_trace_enabled() &&
+                                 csharp_nvdec_memory_snapshot(&memory_before) == 0;
         CUresult result = cuvidCreateDecoder(&decoder->decoder, &info);
         direct_trace(decoder, "create-decoder result=%d(%s) surfaces=%u output=%lu",
                      (int)result, cuda_name(result), surfaces, info.ulNumOutputSurfaces);
         if (!cuda_ok(result)) return 0;
         decoder->decoder_created = 1;
+        decoder->configured_max_width = bucket.max_width;
+        decoder->configured_max_height = bucket.max_height;
+        decoder->configured_surfaces = surfaces;
         atomic_fetch_add_explicit(&direct_decoder_creates, 1, memory_order_relaxed);
+        if (have_memory_before && csharp_nvdec_memory_snapshot(&memory_after) == 0) {
+            trace_memory(decoder, "create", &memory_before, &memory_after,
+                         bucket.max_width, bucket.max_height, surfaces,
+                         info.ulNumOutputSurfaces);
+        }
     }
     decoder->sequence_seen = 1;
     return (int)surfaces;
@@ -709,6 +790,7 @@ void csharp_direct_nvdec_reset_stats(void)
     atomic_store_explicit(&direct_lane_reuses, 0, memory_order_relaxed);
     atomic_store_explicit(&direct_decoder_creates, 0, memory_order_relaxed);
     atomic_store_explicit(&direct_decoder_reconfigures, 0, memory_order_relaxed);
+    atomic_store_explicit(&direct_decoder_bucket_grows, 0, memory_order_relaxed);
     atomic_store_explicit(&direct_decodes, 0, memory_order_relaxed);
 }
 
@@ -719,5 +801,6 @@ void csharp_direct_nvdec_get_stats(struct csharp_direct_nvdec_stats *stats)
     stats->lane_reuses = atomic_load_explicit(&direct_lane_reuses, memory_order_relaxed);
     stats->decoder_creates = atomic_load_explicit(&direct_decoder_creates, memory_order_relaxed);
     stats->decoder_reconfigures = atomic_load_explicit(&direct_decoder_reconfigures, memory_order_relaxed);
+    stats->decoder_bucket_grows = atomic_load_explicit(&direct_decoder_bucket_grows, memory_order_relaxed);
     stats->decodes = atomic_load_explicit(&direct_decodes, memory_order_relaxed);
 }

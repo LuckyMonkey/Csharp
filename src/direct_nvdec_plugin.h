@@ -10,6 +10,7 @@ struct csharp_direct_nvdec_stats {
     unsigned long lane_reuses;
     unsigned long decoder_creates;
     unsigned long decoder_reconfigures;
+    unsigned long decoder_bucket_grows;
     unsigned long decodes;
 };
 
