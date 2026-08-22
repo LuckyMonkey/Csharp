@@ -27,6 +27,9 @@ struct direct_decoder {
     int display_ready;
     int width;
     int height;
+    int configured_width;
+    int configured_height;
+    unsigned int configured_surfaces;
     int display_left;
     int display_top;
     int display_width;
@@ -39,6 +42,7 @@ struct direct_decoder {
     int busy;
     int initialized;
     int has_decoded;
+    CUvideotimestamp next_timestamp;
 };
 
 static struct direct_decoder direct_lanes[DIRECT_LANE_COUNT];
@@ -167,6 +171,9 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
         decoder->decoder_created = 1;
         atomic_fetch_add_explicit(&direct_decoder_creates, 1, memory_order_relaxed);
     }
+    decoder->configured_width = (int)format->coded_width;
+    decoder->configured_height = (int)format->coded_height;
+    decoder->configured_surfaces = surfaces;
     decoder->sequence_seen = 1;
     return (int)surfaces;
 }
@@ -194,6 +201,7 @@ static int initialize_lane(struct direct_decoder *decoder)
     CUcontext previous = NULL;
 
     decoder->display_index = -1;
+    decoder->next_timestamp = 1;
     if (!cuda_ok(cuInit(0)) || !cuda_ok(cuDeviceGet(&device, 0)) ||
         !cuda_ok(cuCtxCreate(&decoder->context, NULL, CU_CTX_SCHED_AUTO, device))) {
         return -1;
@@ -232,37 +240,42 @@ static int supports_format(enum heif_compression_format format)
 
 static struct heif_error new_decoder(void **out_decoder)
 {
-    struct direct_decoder *decoder = NULL;
+    struct direct_decoder *decoder;
+    int was_initialized;
 
     if (!out_decoder) {
         return direct_error(heif_error_Invalid_input, heif_suberror_Invalid_parameter_value,
                             "missing decoder output");
     }
-    lock_lanes();
-    for (int i = 0; i < DIRECT_LANE_COUNT; ++i) {
-        if (!direct_lanes[i].busy) {
-            int was_initialized = direct_lanes[i].initialized;
-            decoder = &direct_lanes[i];
-            decoder->busy = 1;
-            decoder->input_size = 0;
-            decoder->display_ready = 0;
-            decoder->has_decoded = 0;
-            if (!decoder->initialized && initialize_lane(decoder) != 0) {
-                decoder->busy = 0;
-                decoder = NULL;
-            } else if (was_initialized) {
+    for (int attempt = 0; attempt < DIRECT_LANE_COUNT; ++attempt) {
+        decoder = NULL;
+        lock_lanes();
+        for (int i = 0; i < DIRECT_LANE_COUNT; ++i) {
+            if (!direct_lanes[i].busy) {
+                decoder = &direct_lanes[i];
+                was_initialized = decoder->initialized;
+                decoder->busy = 1;
+                decoder->input_size = 0;
+                decoder->display_ready = 0;
+                decoder->has_decoded = 0;
+                break;
+            }
+        }
+        unlock_lanes();
+        if (!decoder) break;
+        if (was_initialized || initialize_lane(decoder) == 0) {
+            if (was_initialized) {
                 atomic_fetch_add_explicit(&direct_lane_reuses, 1, memory_order_relaxed);
             }
-            break;
+            *out_decoder = decoder;
+            return direct_ok();
         }
+        lock_lanes();
+        decoder->busy = 0;
+        unlock_lanes();
     }
-    unlock_lanes();
-    if (!decoder) {
-        return direct_error(heif_error_Unsupported_feature, heif_suberror_Unsupported_codec,
-                            "no direct NVDECODE lane available");
-    }
-    *out_decoder = decoder;
-    return direct_ok();
+    return direct_error(heif_error_Unsupported_feature, heif_suberror_Unsupported_codec,
+                        "direct NVDECODE lane initialization failed or pool exhausted");
 }
 
 static void free_decoder(void *opaque)
@@ -324,9 +337,26 @@ static int length_prefixed_to_annexb(const uint8_t *input, size_t input_size,
     uint8_t *output;
     size_t pos = 0;
     size_t written = 0;
+    size_t nal_count = 0;
+    size_t output_size;
     if (!input || input_size < 4 || !out_data || !out_size) return -1;
-    output = malloc(input_size + 4 * 64);
+
+    while (pos < input_size) {
+        uint32_t nal_size;
+        if (input_size - pos < 4) return -1;
+        nal_size = ((uint32_t)input[pos] << 24) | ((uint32_t)input[pos + 1] << 16) |
+                   ((uint32_t)input[pos + 2] << 8) | input[pos + 3];
+        pos += 4;
+        if (!nal_size || nal_size > input_size - pos) return -1;
+        if (nal_count == SIZE_MAX / 4) return -1;
+        ++nal_count;
+        pos += nal_size;
+    }
+    if (nal_count > (SIZE_MAX - input_size) / 4) return -1;
+    output_size = input_size + nal_count * 4;
+    output = malloc(output_size);
     if (!output) return -1;
+    pos = 0;
     while (pos < input_size) {
         uint32_t nal_size;
         if (input_size - pos < 4) { free(output); return -1; }
@@ -334,7 +364,7 @@ static int length_prefixed_to_annexb(const uint8_t *input, size_t input_size,
                    ((uint32_t)input[pos + 2] << 8) | input[pos + 3];
         pos += 4;
         if (!nal_size || nal_size > input_size - pos) { free(output); return -1; }
-        if (written > input_size + 4 * 64 - (size_t)nal_size - 4) {
+        if (written > output_size - (size_t)nal_size - 4) {
             free(output);
             return -1;
         }
@@ -522,7 +552,7 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
     if (decoder->has_decoded) packet.flags |= CUVID_PKT_DISCONTINUITY;
     packet.payload_size = (unsigned long)annexb_size;
     packet.payload = annexb;
-    packet.timestamp = 1;
+    packet.timestamp = decoder->next_timestamp++;
     decoder->display_ready = 0;
     if (!cuda_ok(cuvidParseVideoData(decoder->parser, &packet))) {
         err = direct_error(heif_error_Decoder_plugin_error, heif_suberror_Unspecified,
