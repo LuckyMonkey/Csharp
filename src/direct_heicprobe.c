@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static uint64_t hash_plane(uint64_t hash, const uint8_t *plane, int stride,
                            int width, int height)
@@ -74,28 +75,55 @@ static int decode(const char *path, struct heif_image **out_cpu,
 
 int main(int argc, char **argv)
 {
-    struct heif_image *cpu = NULL;
-    struct heif_image *direct = NULL;
-    uint64_t cpu_hash = 0;
-    uint64_t direct_hash = 0;
-    int result;
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s image.heic\n", argv[0]);
+    const char *path;
+    int repeats = 1;
+    if (argc == 2) {
+        path = argv[1];
+    } else if (argc == 4 && strcmp(argv[1], "--repeat") == 0) {
+        char *end = NULL;
+        long parsed = strtol(argv[2], &end, 10);
+        if (!end || *end != '\0' || parsed < 1 || parsed > 10000) {
+            fprintf(stderr, "usage: %s [--repeat N] image.heic\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+        repeats = (int)parsed;
+        path = argv[3];
+    } else {
+        fprintf(stderr, "usage: %s [--repeat N] image.heic\n", argv[0]);
         return EXIT_FAILURE;
     }
-    result = decode(argv[1], &cpu, &direct);
-    if (result == 0) result = image_hash(cpu, &cpu_hash) || image_hash(direct, &direct_hash);
-    if (result == 0) {
-        printf("CPU: %dx%d fnv1a=%016" PRIx64 "\n", heif_image_get_primary_width(cpu),
-               heif_image_get_primary_height(cpu), cpu_hash);
-        printf("Direct NVDECODE: %dx%d fnv1a=%016" PRIx64 "\n",
-               heif_image_get_primary_width(direct), heif_image_get_primary_height(direct),
-               direct_hash);
-        result = cpu_hash == direct_hash ? 0 : -1;
-        puts(result == 0 ? "Pixel comparison: exact YCbCr plane match" :
-             "Pixel comparison: decoded bytes differ");
+    csharp_direct_nvdec_reset_stats();
+    for (int i = 0; i < repeats; ++i) {
+        struct heif_image *cpu = NULL;
+        struct heif_image *direct = NULL;
+        uint64_t cpu_hash = 0;
+        uint64_t direct_hash = 0;
+        int result = decode(path, &cpu, &direct);
+        if (result == 0) result = image_hash(cpu, &cpu_hash) || image_hash(direct, &direct_hash);
+        if (result == 0 && (i == 0 || repeats == 1)) {
+            printf("CPU: %dx%d fnv1a=%016" PRIx64 "\n", heif_image_get_primary_width(cpu),
+                   heif_image_get_primary_height(cpu), cpu_hash);
+            printf("Direct NVDECODE: %dx%d fnv1a=%016" PRIx64 "\n",
+                   heif_image_get_primary_width(direct), heif_image_get_primary_height(direct),
+                   direct_hash);
+        }
+        if (result != 0 || cpu_hash != direct_hash) {
+            puts("Pixel comparison: decoded bytes differ");
+            heif_image_release(direct);
+            heif_image_release(cpu);
+            return EXIT_FAILURE;
+        }
+        heif_image_release(direct);
+        heif_image_release(cpu);
     }
-    heif_image_release(direct);
-    heif_image_release(cpu);
-    return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    {
+        struct csharp_direct_nvdec_stats stats;
+        csharp_direct_nvdec_get_stats(&stats);
+        printf("Direct stats: lane_creates=%lu lane_reuses=%lu decoder_creates=%lu "
+               "decoder_reconfigures=%lu decodes=%lu\n",
+               stats.lane_creates, stats.lane_reuses, stats.decoder_creates,
+               stats.decoder_reconfigures, stats.decodes);
+    }
+    puts("Pixel comparison: exact YCbCr plane match");
+    return EXIT_SUCCESS;
 }

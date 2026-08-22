@@ -9,11 +9,13 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #define DIRECT_MAX_INPUT (256U * 1024U * 1024U)
 #define DIRECT_MAX_WIDTH 8192U
 #define DIRECT_MAX_HEIGHT 8192U
+#define DIRECT_LANE_COUNT 32
 
 struct direct_decoder {
     CUcontext context;
@@ -32,7 +34,18 @@ struct direct_decoder {
     uint8_t *input;
     size_t input_size;
     size_t input_capacity;
+    int busy;
+    int initialized;
+    int has_decoded;
 };
+
+static struct direct_decoder direct_lanes[DIRECT_LANE_COUNT];
+static atomic_flag direct_lane_lock = ATOMIC_FLAG_INIT;
+static atomic_ulong direct_lane_creates;
+static atomic_ulong direct_lane_reuses;
+static atomic_ulong direct_decoder_creates;
+static atomic_ulong direct_decoder_reconfigures;
+static atomic_ulong direct_decodes;
 
 static struct heif_error direct_error(enum heif_error_code code,
                                       enum heif_suberror_code subcode,
@@ -49,6 +62,28 @@ static struct heif_error direct_ok(void)
 static int cuda_ok(CUresult result)
 {
     return result == CUDA_SUCCESS;
+}
+
+static void lock_lanes(void)
+{
+    while (atomic_flag_test_and_set_explicit(&direct_lane_lock, memory_order_acquire)) {
+    }
+}
+
+static void unlock_lanes(void)
+{
+    atomic_flag_clear_explicit(&direct_lane_lock, memory_order_release);
+}
+
+static void destroy_lane(struct direct_decoder *decoder)
+{
+    if (!decoder) return;
+    if (decoder->parser) cuvidDestroyVideoParser(decoder->parser);
+    if (decoder->decoder_created) cuvidDestroyDecoder(decoder->decoder);
+    if (decoder->context) cuCtxDestroy(decoder->context);
+    free(decoder->input);
+    memset(decoder, 0, sizeof(*decoder));
+    decoder->display_index = -1;
 }
 
 static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
@@ -123,9 +158,11 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
         reconfigure.display_area.right = info.display_area.right;
         reconfigure.display_area.bottom = info.display_area.bottom;
         if (!cuda_ok(cuvidReconfigureDecoder(decoder->decoder, &reconfigure))) return 0;
+        atomic_fetch_add_explicit(&direct_decoder_reconfigures, 1, memory_order_relaxed);
     } else {
         if (!cuda_ok(cuvidCreateDecoder(&decoder->decoder, &info))) return 0;
         decoder->decoder_created = 1;
+        atomic_fetch_add_explicit(&direct_decoder_creates, 1, memory_order_relaxed);
     }
     decoder->sequence_seen = 1;
     return (int)surfaces;
@@ -147,6 +184,39 @@ static int display_callback(void *opaque, CUVIDPARSERDISPINFO *display)
     return 1;
 }
 
+static int initialize_lane(struct direct_decoder *decoder)
+{
+    CUVIDPARSERPARAMS params;
+    CUdevice device;
+    CUcontext previous = NULL;
+
+    decoder->display_index = -1;
+    if (!cuda_ok(cuInit(0)) || !cuda_ok(cuDeviceGet(&device, 0)) ||
+        !cuda_ok(cuCtxCreate(&decoder->context, NULL, CU_CTX_SCHED_AUTO, device))) {
+        return -1;
+    }
+    memset(&params, 0, sizeof(params));
+    params.CodecType = cudaVideoCodec_HEVC;
+    params.ulMaxNumDecodeSurfaces = 16;
+    params.ulMaxDisplayDelay = 0;
+    params.pUserData = decoder;
+    params.pfnSequenceCallback = sequence_callback;
+    params.pfnDecodePicture = decode_callback;
+    params.pfnDisplayPicture = display_callback;
+    if (!cuda_ok(cuvidCreateVideoParser(&decoder->parser, &params))) {
+        cuCtxDestroy(decoder->context);
+        decoder->context = NULL;
+        return -1;
+    }
+    if (!cuda_ok(cuCtxPopCurrent(&previous))) {
+        destroy_lane(decoder);
+        return -1;
+    }
+    decoder->initialized = 1;
+    atomic_fetch_add_explicit(&direct_lane_creates, 1, memory_order_relaxed);
+    return 0;
+}
+
 static const char *plugin_name(void)
 {
     return "Csharp direct NVDECODE HEVC decoder";
@@ -159,46 +229,34 @@ static int supports_format(enum heif_compression_format format)
 
 static struct heif_error new_decoder(void **out_decoder)
 {
-    struct direct_decoder *decoder;
-    CUVIDPARSERPARAMS params;
+    struct direct_decoder *decoder = NULL;
 
     if (!out_decoder) {
         return direct_error(heif_error_Invalid_input, heif_suberror_Invalid_parameter_value,
                             "missing decoder output");
     }
-    decoder = calloc(1, sizeof(*decoder));
-    if (!decoder) {
-        return direct_error(heif_error_Memory_allocation_error, heif_suberror_Unspecified,
-                            "direct decoder allocation failed");
-    }
-    decoder->display_index = -1;
-    if (!cuda_ok(cuInit(0))) {
-        free(decoder);
-        return direct_error(heif_error_Unsupported_feature, heif_suberror_Unsupported_codec,
-                            "CUDA device initialization failed");
-    }
-    {
-        CUdevice device;
-        if (!cuda_ok(cuDeviceGet(&device, 0)) ||
-            !cuda_ok(cuCtxCreate(&decoder->context, NULL, CU_CTX_SCHED_AUTO, device))) {
-            free(decoder);
-            return direct_error(heif_error_Unsupported_feature, heif_suberror_Unsupported_codec,
-                                "CUDA context creation failed");
+    lock_lanes();
+    for (int i = 0; i < DIRECT_LANE_COUNT; ++i) {
+        if (!direct_lanes[i].busy) {
+            int was_initialized = direct_lanes[i].initialized;
+            decoder = &direct_lanes[i];
+            decoder->busy = 1;
+            decoder->input_size = 0;
+            decoder->display_ready = 0;
+            decoder->has_decoded = 0;
+            if (!decoder->initialized && initialize_lane(decoder) != 0) {
+                decoder->busy = 0;
+                decoder = NULL;
+            } else if (was_initialized) {
+                atomic_fetch_add_explicit(&direct_lane_reuses, 1, memory_order_relaxed);
+            }
+            break;
         }
     }
-    memset(&params, 0, sizeof(params));
-    params.CodecType = cudaVideoCodec_HEVC;
-    params.ulMaxNumDecodeSurfaces = 16;
-    params.ulMaxDisplayDelay = 0;
-    params.pUserData = decoder;
-    params.pfnSequenceCallback = sequence_callback;
-    params.pfnDecodePicture = decode_callback;
-    params.pfnDisplayPicture = display_callback;
-    if (!cuda_ok(cuvidCreateVideoParser(&decoder->parser, &params))) {
-        cuCtxDestroy(decoder->context);
-        free(decoder);
+    unlock_lanes();
+    if (!decoder) {
         return direct_error(heif_error_Unsupported_feature, heif_suberror_Unsupported_codec,
-                            "CUVID parser creation failed");
+                            "no direct NVDECODE lane available");
     }
     *out_decoder = decoder;
     return direct_ok();
@@ -208,11 +266,20 @@ static void free_decoder(void *opaque)
 {
     struct direct_decoder *decoder = opaque;
     if (!decoder) return;
-    if (decoder->parser) cuvidDestroyVideoParser(decoder->parser);
-    if (decoder->decoder_created) cuvidDestroyDecoder(decoder->decoder);
-    if (decoder->context) cuCtxDestroy(decoder->context);
-    free(decoder->input);
-    free(decoder);
+    decoder->input_size = 0;
+    decoder->display_ready = 0;
+    lock_lanes();
+    decoder->busy = 0;
+    unlock_lanes();
+}
+
+static void deinit_plugin(void)
+{
+    lock_lanes();
+    for (int i = 0; i < DIRECT_LANE_COUNT; ++i) {
+        if (!direct_lanes[i].busy) destroy_lane(&direct_lanes[i]);
+    }
+    unlock_lanes();
 }
 
 static struct heif_error push_data(void *opaque, const void *data, size_t size)
@@ -382,6 +449,8 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
     CUdeviceptr mapped = 0;
     unsigned int pitch = 0;
     CUVIDPROCPARAMS proc;
+    CUcontext previous = NULL;
+    int context_pushed = 0;
     struct heif_error err = direct_ok();
 
     if (!decoder || !out_image || !decoder->input_size) {
@@ -389,6 +458,11 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
                             "empty direct HEVC input");
     }
     *out_image = NULL;
+    if (!cuda_ok(cuCtxPushCurrent(decoder->context))) {
+        return direct_error(heif_error_Decoder_plugin_error, heif_suberror_Unspecified,
+                            "CUDA context activation failed");
+    }
+    context_pushed = 1;
     if (length_prefixed_to_annexb(decoder->input, decoder->input_size,
                                   &annexb, &annexb_size) != 0) {
         return direct_error(heif_error_Invalid_input, heif_suberror_End_of_data,
@@ -396,6 +470,7 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
     }
     memset(&packet, 0, sizeof(packet));
     packet.flags = CUVID_PKT_TIMESTAMP | CUVID_PKT_ENDOFPICTURE;
+    if (decoder->has_decoded) packet.flags |= CUVID_PKT_DISCONTINUITY;
     packet.payload_size = (unsigned long)annexb_size;
     packet.payload = annexb;
     packet.timestamp = 1;
@@ -405,6 +480,7 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
                            "CUVID parser rejected HEVC stream");
         goto cleanup;
     }
+    decoder->has_decoded = 1;
     memset(&eos, 0, sizeof(eos));
     eos.flags = CUVID_PKT_ENDOFSTREAM | CUVID_PKT_NOTIFY_EOS;
     if (!cuda_ok(cuvidParseVideoData(decoder->parser, &eos)) || !decoder->display_ready) {
@@ -427,10 +503,16 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
                            "CUVID surface unmapping failed");
     }
 cleanup:
+    if (context_pushed) {
+        (void)cuCtxPopCurrent(&previous);
+    }
     free(annexb);
     if (err.code != heif_error_Ok && out_image && *out_image) {
         heif_image_release(*out_image);
         *out_image = NULL;
+    }
+    if (err.code == heif_error_Ok) {
+        atomic_fetch_add_explicit(&direct_decodes, 1, memory_order_relaxed);
     }
     return err;
 }
@@ -439,7 +521,7 @@ static const struct heif_decoder_plugin plugin = {
     .plugin_api_version = 3,
     .get_plugin_name = plugin_name,
     .init_plugin = NULL,
-    .deinit_plugin = NULL,
+    .deinit_plugin = deinit_plugin,
     .does_support_format = supports_format,
     .new_decoder = new_decoder,
     .free_decoder = free_decoder,
@@ -452,4 +534,23 @@ static const struct heif_decoder_plugin plugin = {
 struct heif_error csharp_register_direct_nvdec_plugin(void)
 {
     return heif_register_decoder_plugin(&plugin);
+}
+
+void csharp_direct_nvdec_reset_stats(void)
+{
+    atomic_store_explicit(&direct_lane_creates, 0, memory_order_relaxed);
+    atomic_store_explicit(&direct_lane_reuses, 0, memory_order_relaxed);
+    atomic_store_explicit(&direct_decoder_creates, 0, memory_order_relaxed);
+    atomic_store_explicit(&direct_decoder_reconfigures, 0, memory_order_relaxed);
+    atomic_store_explicit(&direct_decodes, 0, memory_order_relaxed);
+}
+
+void csharp_direct_nvdec_get_stats(struct csharp_direct_nvdec_stats *stats)
+{
+    if (!stats) return;
+    stats->lane_creates = atomic_load_explicit(&direct_lane_creates, memory_order_relaxed);
+    stats->lane_reuses = atomic_load_explicit(&direct_lane_reuses, memory_order_relaxed);
+    stats->decoder_creates = atomic_load_explicit(&direct_decoder_creates, memory_order_relaxed);
+    stats->decoder_reconfigures = atomic_load_explicit(&direct_decoder_reconfigures, memory_order_relaxed);
+    stats->decodes = atomic_load_explicit(&direct_decodes, memory_order_relaxed);
 }
