@@ -7,6 +7,7 @@
 #include <libheif/heif_plugin.h>
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -70,6 +71,13 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
     decoder->display_top = format->display_area.top;
     decoder->display_width = format->display_area.right - format->display_area.left;
     decoder->display_height = format->display_area.bottom - format->display_area.top;
+    if (getenv("CSHARP_DIRECT_GEOMETRY_DEBUG")) {
+        fprintf(stderr, "direct geometry coded=%ux%u display_area=%d,%d-%d,%d visible=%dx%d\n",
+                format->coded_width, format->coded_height,
+                format->display_area.left, format->display_area.top,
+                format->display_area.right, format->display_area.bottom,
+                decoder->display_width, decoder->display_height);
+    }
     if (decoder->display_width <= 0 || decoder->display_height <= 0 ||
         decoder->display_left < 0 || decoder->display_top < 0 ||
         decoder->display_left + decoder->display_width > decoder->width ||
@@ -92,10 +100,10 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
     info.ulIntraDecodeOnly = 0;
     info.ulMaxWidth = DIRECT_MAX_WIDTH;
     info.ulMaxHeight = DIRECT_MAX_HEIGHT;
-    info.display_area.left = (short)format->display_area.left;
-    info.display_area.top = (short)format->display_area.top;
-    info.display_area.right = (short)format->display_area.right;
-    info.display_area.bottom = (short)format->display_area.bottom;
+    info.display_area.left = 0;
+    info.display_area.top = 0;
+    info.display_area.right = (short)format->coded_width;
+    info.display_area.bottom = (short)format->coded_height;
     info.OutputFormat = cudaVideoSurfaceFormat_NV12;
     info.DeinterlaceMode = cudaVideoDeinterlaceMode_Weave;
     info.ulTargetWidth = format->coded_width;
@@ -114,10 +122,6 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
         reconfigure.display_area.top = info.display_area.top;
         reconfigure.display_area.right = info.display_area.right;
         reconfigure.display_area.bottom = info.display_area.bottom;
-        reconfigure.target_rect.left = info.target_rect.left;
-        reconfigure.target_rect.top = info.target_rect.top;
-        reconfigure.target_rect.right = info.target_rect.right;
-        reconfigure.target_rect.bottom = info.target_rect.bottom;
         if (!cuda_ok(cuvidReconfigureDecoder(decoder->decoder, &reconfigure))) return 0;
     } else {
         if (!cuda_ok(cuvidCreateDecoder(&decoder->decoder, &info))) return 0;
@@ -291,6 +295,15 @@ static struct heif_error make_image(const struct direct_decoder *decoder,
     CUVIDPROCPARAMS proc;
     CUdeviceptr source;
 
+    if (getenv("CSHARP_DIRECT_GEOMETRY_DEBUG")) {
+        fprintf(stderr, "direct mapped pitch=%u output=%dx%d luma_crop=(%d,%d %dx%d) chroma_crop=(%d,%d %dx%d)\n",
+                pitch, decoder->display_width, decoder->display_height,
+                decoder->display_left, decoder->display_top,
+                decoder->display_width, decoder->display_height,
+                decoder->display_left / 2, decoder->display_top / 2,
+                (decoder->display_width + 1) / 2, (decoder->display_height + 1) / 2);
+    }
+
     err = heif_image_create(decoder->display_width, decoder->display_height,
                             heif_colorspace_YCbCr, heif_chroma_420, out_image);
     if (err.code != heif_error_Ok) return err;
@@ -311,6 +324,12 @@ static struct heif_error make_image(const struct direct_decoder *decoder,
     if (!y || !cb || !cr) return direct_error(heif_error_Decoder_plugin_error,
                                               heif_suberror_Unspecified,
                                               "cannot access direct output planes");
+    if (getenv("CSHARP_DIRECT_GEOMETRY_DEBUG")) {
+        fprintf(stderr, "direct heif strides Y=%d Cb=%d Cr=%d dimensions=%dx%d chroma=%dx%d\n",
+                y_stride, cb_stride, cr_stride, decoder->display_width,
+                decoder->display_height, (decoder->display_width + 1) / 2,
+                (decoder->display_height + 1) / 2);
+    }
     memset(&proc, 0, sizeof(proc));
     proc.progressive_frame = 1;
     source = mapped + (CUdeviceptr)decoder->display_top * pitch + decoder->display_left;
