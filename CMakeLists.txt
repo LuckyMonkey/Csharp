@@ -106,6 +106,7 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
     target_link_libraries(csharp-direct-heicprobe PRIVATE
         PkgConfig::LIBHEIF
         csharp-direct-nvdecode
+        Threads::Threads
     )
     target_compile_options(csharp-direct-heicprobe PRIVATE
         -Wall

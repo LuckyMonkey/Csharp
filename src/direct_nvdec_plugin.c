@@ -8,8 +8,10 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <string.h>
 
 #define DIRECT_MAX_INPUT (256U * 1024U * 1024U)
@@ -39,11 +41,14 @@ struct direct_decoder {
     int busy;
     int initialized;
     int has_decoded;
+    int lane_id;
     CUvideotimestamp next_timestamp;
 };
 
 static struct direct_decoder direct_lanes[DIRECT_LANE_COUNT];
-static atomic_flag direct_lane_lock = ATOMIC_FLAG_INIT;
+static pthread_mutex_t direct_lane_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t direct_lane_available = PTHREAD_COND_INITIALIZER;
+static unsigned int direct_active_lanes;
 static atomic_ulong direct_lane_creates;
 static atomic_ulong direct_lane_reuses;
 static atomic_ulong direct_decoder_creates;
@@ -67,15 +72,56 @@ static int cuda_ok(CUresult result)
     return result == CUDA_SUCCESS;
 }
 
+static const char *cuda_name(CUresult result)
+{
+    const char *name = NULL;
+    if (cuGetErrorName(result, &name) != CUDA_SUCCESS || !name) return "CUDA_ERROR_UNKNOWN";
+    return name;
+}
+
+static int direct_trace_enabled(void)
+{
+    const char *value = getenv("CSHARP_DIRECT_TRACE");
+    return value && *value && *value != '0';
+}
+
+static void direct_trace(struct direct_decoder *decoder, const char *event, ...)
+{
+    CUcontext current = NULL;
+    va_list args;
+    if (!direct_trace_enabled()) return;
+    (void)cuCtxGetCurrent(&current);
+    fprintf(stderr, "direct-trace: lane=%d tid=%lu lane_ctx=%p current_ctx=%p parser=%p decoder=%p ",
+            decoder ? decoder->lane_id : -1, (unsigned long)pthread_self(),
+            decoder ? (void *)decoder->context : NULL, (void *)current,
+            decoder ? (void *)decoder->parser : NULL,
+            decoder ? (void *)decoder->decoder : NULL, event);
+    va_start(args, event);
+    vfprintf(stderr, event, args);
+    va_end(args);
+    fputc('\n', stderr);
+}
+
 static void lock_lanes(void)
 {
-    while (atomic_flag_test_and_set_explicit(&direct_lane_lock, memory_order_acquire)) {
-    }
+    (void)pthread_mutex_lock(&direct_lane_lock);
 }
 
 static void unlock_lanes(void)
 {
-    atomic_flag_clear_explicit(&direct_lane_lock, memory_order_release);
+    (void)pthread_mutex_unlock(&direct_lane_lock);
+}
+
+static unsigned int active_lane_limit(void)
+{
+    const char *value = getenv("CSHARP_DIRECT_MAX_ACTIVE_LANES");
+    char *end = NULL;
+    unsigned long parsed;
+    if (!value || !*value) return 4;
+    parsed = strtoul(value, &end, 10);
+    if (!end || *end != '\0' || parsed < 1) return 4;
+    if (parsed > DIRECT_LANE_COUNT) parsed = DIRECT_LANE_COUNT;
+    return (unsigned int)parsed;
 }
 
 static void destroy_lane(struct direct_decoder *decoder)
@@ -110,6 +156,11 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
     decoder->display_top = format->display_area.top;
     decoder->display_width = format->display_area.right - format->display_area.left;
     decoder->display_height = format->display_area.bottom - format->display_area.top;
+    direct_trace(decoder, "sequence coded=%ux%u display=%d,%d-%d,%d surfaces_min=%u",
+                 format->coded_width, format->coded_height,
+                 format->display_area.left, format->display_area.top,
+                 format->display_area.right, format->display_area.bottom,
+                 format->min_num_decode_surfaces);
     if (getenv("CSHARP_DIRECT_GEOMETRY_DEBUG")) {
         fprintf(stderr, "direct geometry coded=%ux%u display_area=%d,%d-%d,%d visible=%dx%d\n",
                 format->coded_width, format->coded_height,
@@ -161,10 +212,16 @@ static int sequence_callback(void *opaque, CUVIDEOFORMAT *format)
         reconfigure.display_area.top = info.display_area.top;
         reconfigure.display_area.right = info.display_area.right;
         reconfigure.display_area.bottom = info.display_area.bottom;
-        if (!cuda_ok(cuvidReconfigureDecoder(decoder->decoder, &reconfigure))) return 0;
+        CUresult result = cuvidReconfigureDecoder(decoder->decoder, &reconfigure);
+        direct_trace(decoder, "reconfigure result=%d(%s) surfaces=%u",
+                     (int)result, cuda_name(result), surfaces);
+        if (!cuda_ok(result)) return 0;
         atomic_fetch_add_explicit(&direct_decoder_reconfigures, 1, memory_order_relaxed);
     } else {
-        if (!cuda_ok(cuvidCreateDecoder(&decoder->decoder, &info))) return 0;
+        CUresult result = cuvidCreateDecoder(&decoder->decoder, &info);
+        direct_trace(decoder, "create-decoder result=%d(%s) surfaces=%u output=%lu",
+                     (int)result, cuda_name(result), surfaces, info.ulNumOutputSurfaces);
+        if (!cuda_ok(result)) return 0;
         decoder->decoder_created = 1;
         atomic_fetch_add_explicit(&direct_decoder_creates, 1, memory_order_relaxed);
     }
@@ -176,7 +233,10 @@ static int decode_callback(void *opaque, CUVIDPICPARAMS *picture)
 {
     struct direct_decoder *decoder = opaque;
     if (!decoder || !decoder->decoder_created || !picture) return 0;
-    return cuda_ok(cuvidDecodePicture(decoder->decoder, picture)) ? 1 : 0;
+    CUresult result = cuvidDecodePicture(decoder->decoder, picture);
+    direct_trace(decoder, "decode-picture curr=%d result=%d(%s)",
+                 picture->CurrPicIdx, (int)result, cuda_name(result));
+    return cuda_ok(result) ? 1 : 0;
 }
 
 static int display_callback(void *opaque, CUVIDPARSERDISPINFO *display)
@@ -185,6 +245,7 @@ static int display_callback(void *opaque, CUVIDPARSERDISPINFO *display)
     if (!decoder || !display) return 1;
     decoder->display_index = display->picture_index;
     decoder->display_ready = 1;
+    direct_trace(decoder, "display picture=%d", display->picture_index);
     return 1;
 }
 
@@ -236,40 +297,49 @@ static struct heif_error new_decoder(void **out_decoder)
 {
     struct direct_decoder *decoder;
     int was_initialized;
+    unsigned int limit = active_lane_limit();
 
     if (!out_decoder) {
         return direct_error(heif_error_Invalid_input, heif_suberror_Invalid_parameter_value,
                             "missing decoder output");
     }
-    for (int attempt = 0; attempt < DIRECT_LANE_COUNT; ++attempt) {
+    lock_lanes();
+    for (;;) {
         decoder = NULL;
-        lock_lanes();
+        while (direct_active_lanes >= limit) {
+            (void)pthread_cond_wait(&direct_lane_available, &direct_lane_lock);
+        }
         for (int i = 0; i < DIRECT_LANE_COUNT; ++i) {
             if (!direct_lanes[i].busy) {
                 decoder = &direct_lanes[i];
+                decoder->lane_id = i;
                 was_initialized = decoder->initialized;
                 decoder->busy = 1;
                 decoder->input_size = 0;
                 decoder->display_ready = 0;
                 decoder->has_decoded = 0;
+                ++direct_active_lanes;
                 break;
             }
         }
-        unlock_lanes();
-        if (!decoder) break;
-        if (was_initialized || initialize_lane(decoder) == 0) {
-            if (was_initialized) {
-                atomic_fetch_add_explicit(&direct_lane_reuses, 1, memory_order_relaxed);
-            }
-            *out_decoder = decoder;
-            return direct_ok();
-        }
+        if (decoder) break;
+        (void)pthread_cond_wait(&direct_lane_available, &direct_lane_lock);
+    }
+    unlock_lanes();
+    if (!was_initialized && initialize_lane(decoder) != 0) {
         lock_lanes();
         decoder->busy = 0;
+        --direct_active_lanes;
+        (void)pthread_cond_broadcast(&direct_lane_available);
         unlock_lanes();
+        return direct_error(heif_error_Unsupported_feature, heif_suberror_Unsupported_codec,
+                            "direct NVDECODE lane initialization failed");
     }
-    return direct_error(heif_error_Unsupported_feature, heif_suberror_Unsupported_codec,
-                        "direct NVDECODE lane initialization failed or pool exhausted");
+    if (was_initialized) {
+        atomic_fetch_add_explicit(&direct_lane_reuses, 1, memory_order_relaxed);
+    }
+    *out_decoder = decoder;
+    return direct_ok();
 }
 
 static void free_decoder(void *opaque)
@@ -280,6 +350,8 @@ static void free_decoder(void *opaque)
     decoder->display_ready = 0;
     lock_lanes();
     decoder->busy = 0;
+    if (direct_active_lanes > 0) --direct_active_lanes;
+    (void)pthread_cond_signal(&direct_lane_available);
     unlock_lanes();
 }
 
@@ -551,32 +623,51 @@ static struct heif_error decode_image(void *opaque, struct heif_image **out_imag
     packet.payload = annexb;
     packet.timestamp = decoder->next_timestamp++;
     decoder->display_ready = 0;
-    if (!cuda_ok(cuvidParseVideoData(decoder->parser, &packet))) {
-        err = direct_error(heif_error_Decoder_plugin_error, heif_suberror_Unspecified,
-                           "CUVID parser rejected HEVC stream");
-        goto cleanup;
+    direct_trace(decoder, "packet flags=0x%lx bytes=%lu timestamp=%lld",
+                 packet.flags, packet.payload_size, (long long)packet.timestamp);
+    {
+        CUresult result = cuvidParseVideoData(decoder->parser, &packet);
+        direct_trace(decoder, "parse packet result=%d(%s)", (int)result, cuda_name(result));
+        if (!cuda_ok(result)) {
+            err = direct_error(heif_error_Decoder_plugin_error, heif_suberror_Unspecified,
+                               "CUVID parser rejected HEVC stream");
+            goto cleanup;
+        }
     }
     decoder->has_decoded = 1;
     memset(&eos, 0, sizeof(eos));
     eos.flags = CUVID_PKT_ENDOFSTREAM | CUVID_PKT_NOTIFY_EOS;
-    if (!cuda_ok(cuvidParseVideoData(decoder->parser, &eos)) || !decoder->display_ready) {
+    {
+        CUresult result = cuvidParseVideoData(decoder->parser, &eos);
+        direct_trace(decoder, "parse eos result=%d(%s) display_ready=%d",
+                     (int)result, cuda_name(result), decoder->display_ready);
+        if (!cuda_ok(result) || !decoder->display_ready) {
         err = direct_error(heif_error_Decoder_plugin_error, heif_suberror_Unspecified,
                            "CUVID produced no decoded picture");
         goto cleanup;
+        }
     }
     memset(&proc, 0, sizeof(proc));
     proc.progressive_frame = 1;
-    if (!cuda_ok(cuvidMapVideoFrame(decoder->decoder, decoder->display_index,
-                                    &mapped, &pitch, &proc))) {
+    {
+        CUresult result = cuvidMapVideoFrame(decoder->decoder, decoder->display_index,
+                                              &mapped, &pitch, &proc);
+        direct_trace(decoder, "map picture=%d result=%d(%s) pitch=%u",
+                     decoder->display_index, (int)result, cuda_name(result), pitch);
+        if (!cuda_ok(result)) {
         err = direct_error(heif_error_Decoder_plugin_error, heif_suberror_Unspecified,
                            "CUVID surface mapping failed");
         goto cleanup;
+        }
     }
     err = make_image(decoder, mapped, pitch, out_image);
-    if (!cuda_ok(cuvidUnmapVideoFrame(decoder->decoder, mapped)) &&
-        err.code == heif_error_Ok) {
+    {
+        CUresult result = cuvidUnmapVideoFrame(decoder->decoder, mapped);
+        direct_trace(decoder, "unmap result=%d(%s)", (int)result, cuda_name(result));
+        if (!cuda_ok(result) && err.code == heif_error_Ok) {
         err = direct_error(heif_error_Decoder_plugin_error, heif_suberror_Unspecified,
                            "CUVID surface unmapping failed");
+        }
     }
 cleanup:
     if (context_pushed) {
