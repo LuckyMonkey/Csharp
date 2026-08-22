@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int trace_enabled(void)
 {
@@ -64,11 +65,17 @@ static void *next_symbol(const char *name)
     return symbol;
 }
 
+#define LOAD_SYMBOL(function_pointer, symbol_name) \
+    do { \
+        void *symbol_value = next_symbol(symbol_name); \
+        memcpy(&(function_pointer), &symbol_value, sizeof(function_pointer)); \
+    } while (0)
+
 CUresult CUDAAPI cuvidCreateVideoParser(CUvideoparser *parser, CUVIDPARSERPARAMS *params)
 {
     static create_parser_fn real_fn;
     CUresult result;
-    if (!real_fn) real_fn = (create_parser_fn)next_symbol("cuvidCreateVideoParser");
+    if (!real_fn) LOAD_SYMBOL(real_fn, "cuvidCreateVideoParser");
     result = real_fn(parser, params);
     if (trace_enabled()) {
         fprintf(stderr,
@@ -86,7 +93,7 @@ CUresult CUDAAPI cuvidDestroyVideoParser(CUvideoparser parser)
 {
     static destroy_parser_fn real_fn;
     CUresult result;
-    if (!real_fn) real_fn = (destroy_parser_fn)next_symbol("cuvidDestroyVideoParser");
+    if (!real_fn) LOAD_SYMBOL(real_fn, "cuvidDestroyVideoParser");
     result = real_fn(parser);
     TRACE_CALL("destroy-parser", parser, result);
     return result;
@@ -96,7 +103,7 @@ CUresult CUDAAPI cuvidParseVideoData(CUvideoparser parser, CUVIDSOURCEDATAPACKET
 {
     static parse_video_fn real_fn;
     CUresult result;
-    if (!real_fn) real_fn = (parse_video_fn)next_symbol("cuvidParseVideoData");
+    if (!real_fn) LOAD_SYMBOL(real_fn, "cuvidParseVideoData");
     if (trace_enabled()) {
         fprintf(stderr,
                 "csharp-nvcuvid-trace: tid=%lu ctx=%p parse-enter parser=%p flags=0x%lx bytes=%lu ts=%lld\n",
@@ -114,7 +121,7 @@ CUresult CUDAAPI cuvidCreateDecoder(CUvideodecoder *decoder, CUVIDDECODECREATEIN
 {
     static create_decoder_fn real_fn;
     CUresult result;
-    if (!real_fn) real_fn = (create_decoder_fn)next_symbol("cuvidCreateDecoder");
+    if (!real_fn) LOAD_SYMBOL(real_fn, "cuvidCreateDecoder");
     result = real_fn(decoder, info);
     if (trace_enabled()) {
         fprintf(stderr,
@@ -133,7 +140,7 @@ CUresult CUDAAPI cuvidDestroyDecoder(CUvideodecoder decoder)
 {
     static destroy_decoder_fn real_fn;
     CUresult result;
-    if (!real_fn) real_fn = (destroy_decoder_fn)next_symbol("cuvidDestroyDecoder");
+    if (!real_fn) LOAD_SYMBOL(real_fn, "cuvidDestroyDecoder");
     result = real_fn(decoder);
     TRACE_CALL("destroy-decoder", decoder, result);
     return result;
@@ -143,7 +150,7 @@ CUresult CUDAAPI cuvidReconfigureDecoder(CUvideodecoder decoder, CUVIDRECONFIGUR
 {
     static reconfigure_decoder_fn real_fn;
     CUresult result;
-    if (!real_fn) real_fn = (reconfigure_decoder_fn)next_symbol("cuvidReconfigureDecoder");
+    if (!real_fn) LOAD_SYMBOL(real_fn, "cuvidReconfigureDecoder");
     result = real_fn(decoder, info);
     if (trace_enabled()) {
         fprintf(stderr,
@@ -161,15 +168,15 @@ CUresult CUDAAPI cuvidDecodePicture(CUvideodecoder decoder, CUVIDPICPARAMS *pict
 {
     static decode_picture_fn real_fn;
     CUresult result;
-    if (!real_fn) real_fn = (decode_picture_fn)next_symbol("cuvidDecodePicture");
+    if (!real_fn) LOAD_SYMBOL(real_fn, "cuvidDecodePicture");
     result = real_fn(decoder, picture);
     if (trace_enabled()) {
         fprintf(stderr,
                 "csharp-nvcuvid-trace: tid=%lu ctx=%p decode decoder=%p curr_pic=%d field_pic=%u bottom=%u result=%d(%s)\n",
                 trace_thread(), (void *)trace_context(), (void *)decoder,
                 picture ? picture->CurrPicIdx : -1,
-                picture ? picture->field_pic_flag : 0U,
-                picture ? picture->bottom_field_flag : 0U,
+                picture ? (unsigned int)picture->field_pic_flag : 0U,
+                picture ? (unsigned int)picture->bottom_field_flag : 0U,
                 (int)result, cuda_result_name(result));
     }
     return result;
@@ -181,7 +188,7 @@ CUresult CUDAAPI cuvidMapVideoFrame(CUvideodecoder decoder, int picture_index,
 {
     static map_frame_fn real_fn;
     CUresult result;
-    if (!real_fn) real_fn = (map_frame_fn)next_symbol("cuvidMapVideoFrame");
+    if (!real_fn) LOAD_SYMBOL(real_fn, "cuvidMapVideoFrame64");
     result = real_fn(decoder, picture_index, device_ptr, pitch, params);
     if (trace_enabled()) {
         fprintf(stderr,
@@ -197,7 +204,7 @@ CUresult CUDAAPI cuvidUnmapVideoFrame(CUvideodecoder decoder, CUdeviceptr device
 {
     static unmap_frame_fn real_fn;
     CUresult result;
-    if (!real_fn) real_fn = (unmap_frame_fn)next_symbol("cuvidUnmapVideoFrame");
+    if (!real_fn) LOAD_SYMBOL(real_fn, "cuvidUnmapVideoFrame64");
     result = real_fn(decoder, device_ptr);
     TRACE_CALL("unmap", decoder, result);
     return result;
