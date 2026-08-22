@@ -28,6 +28,8 @@
 #define CSHARP_VERSION "0.1.0"
 #define DEFAULT_QUALITY 90
 #define MAX_JPEG_MARKER 65533U
+#define CSHARP_EXIT_CONVERSION 1
+#define CSHARP_EXIT_USAGE 2
 
 enum backend { BACKEND_DIRECT, BACKEND_CPU };
 
@@ -613,7 +615,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
             char *end = NULL; long value = strtol(argv[++i], &end, 10);
             if (!end || *end != '\0' || value < 1 || value > 100) {
-                fputs("csharp: quality must be an integer from 1 to 100\n", stderr); return EXIT_FAILURE;
+                fputs("csharp: quality must be an integer from 1 to 100\n", stderr); return CSHARP_EXIT_USAGE;
             }
             quality = (int)value; continue;
         }
@@ -621,15 +623,15 @@ int main(int argc, char **argv)
             ++i;
             if (strcmp(argv[i], "direct") == 0) backend = BACKEND_DIRECT;
             else if (strcmp(argv[i], "cpu") == 0) backend = BACKEND_CPU;
-            else { fputs("csharp: backend must be direct or cpu\n", stderr); return EXIT_FAILURE; }
+            else { fputs("csharp: backend must be direct or cpu\n", stderr); return CSHARP_EXIT_USAGE; }
             continue;
         }
-        if (argv[i][0] == '-') { fprintf(stderr, "csharp: unknown option: %s\n", argv[i]); return EXIT_FAILURE; }
+        if (argv[i][0] == '-') { fprintf(stderr, "csharp: unknown option: %s\n", argv[i]); return CSHARP_EXIT_USAGE; }
         if (!input) input = argv[i];
         else if (!output) output = argv[i];
-        else { fputs("csharp: expected one input and one output\n", stderr); return EXIT_FAILURE; }
+        else { fputs("csharp: expected one input and one output\n", stderr); return CSHARP_EXIT_USAGE; }
     }
-    if (!input || !output) { usage(stderr); return EXIT_FAILURE; }
+    if (!input || !output) { usage(stderr); return CSHARP_EXIT_USAGE; }
     return convert_file(input, output, overwrite, backend, quality, verbose,
-                        report_path, no_fallback) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+                        report_path, no_fallback) == 0 ? EXIT_SUCCESS : CSHARP_EXIT_CONVERSION;
 }
