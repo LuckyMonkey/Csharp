@@ -115,25 +115,21 @@ static void write32(uint8_t *p, bool little, uint32_t value)
 /* HEIF EXIF payloads conventionally begin with a four-byte TIFF offset. */
 static void normalize_exif_orientation(uint8_t *data, size_t size)
 {
-    size_t base = 0;
     const uint8_t *tiff;
     bool little;
     uint32_t ifd_offset;
     uint16_t entries;
 
     if (!data || size < 14) return;
-    if (size >= 6 && memcmp(data, "Exif\0\0", 6) == 0) base = 6;
-    else if (size >= 4) base = 4;
-    if (base > size || size - base < 8) return;
-    tiff = data + base;
+    tiff = data;
     if (memcmp(tiff, "II", 2) == 0) little = true;
     else if (memcmp(tiff, "MM", 2) == 0) little = false;
     else return;
     if (read16(tiff + 2, little) != 42) return;
     ifd_offset = read32(tiff + 4, little);
-    if (ifd_offset > size - base || size - base - ifd_offset < 2) return;
+    if (ifd_offset > size || size - ifd_offset < 2) return;
     entries = read16(tiff + ifd_offset, little);
-    if ((size_t)entries > (size - base - ifd_offset - 2) / 12) return;
+    if ((size_t)entries > (size - ifd_offset - 2) / 12) return;
     for (uint16_t i = 0; i < entries; ++i) {
         uint8_t *entry = (uint8_t *)tiff + ifd_offset + 2U + (size_t)i * 12U;
         uint16_t tag = read16(entry, little);
@@ -183,18 +179,29 @@ static int write_metadata(struct jpeg_compress_struct *jpeg,
             continue;
         }
         if (strcmp(type_copy, "Exif") == 0) {
-            size_t offset = size >= 4 ? 4 : 0;
-            if (size - offset > SIZE_MAX - 6) {
+            size_t tiff_offset;
+            uint32_t exif_offset;
+            if (size < 4) {
+                free(blob.data);
+                continue;
+            }
+            exif_offset = read32(blob.data, false);
+            if (exif_offset > size - 4 || size - 4 - exif_offset < 8) {
+                free(blob.data);
+                continue;
+            }
+            tiff_offset = 4U + (size_t)exif_offset;
+            if (size - tiff_offset > SIZE_MAX - 6) {
                 free(blob.data); free(ids); return -1;
             }
-            size_t payload_size = size - offset + 6;
+            size_t payload_size = size - tiff_offset + 6;
             uint8_t *payload = malloc(payload_size);
             if (!payload || payload_size > MAX_JPEG_MARKER) {
                 free(payload); free(blob.data); free(ids); return -1;
             }
-            normalize_exif_orientation(blob.data, size);
+            normalize_exif_orientation(blob.data + tiff_offset, size - tiff_offset);
             memcpy(payload, "Exif\0\0", 6);
-            memcpy(payload + 6, blob.data + offset, size - offset);
+            memcpy(payload + 6, blob.data + tiff_offset, size - tiff_offset);
             if (write_marker(jpeg, JPEG_APP0 + 1, payload, payload_size) != 0) {
                 free(payload); free(blob.data); free(ids); return -1;
             }
