@@ -22,6 +22,13 @@ nvJPEG
 JPEG
 ```
 
+Csharp has two performance goals, and they are deliberately separate:
+
+1. maximize images/second when GPU acceleration actually wins;
+2. provide a low-CPU decode path when preserving CPU headroom is more valuable than minimum wall time.
+
+A GPU path may therefore still be useful when it is slower in elapsed time if it materially reduces CPU-seconds consumed while PhotoSort or other workloads need the CPU.
+
 ## Phase 1
 
 `heicprobe` establishes the boring, safe foundation before GPU decode work:
@@ -66,16 +73,33 @@ warm repeated decodes:
 ./build/heicprobe --benchmark 100 sample1.heic sample2.heic
 ```
 
-The benchmark currently creates one `AVCodecContext`/NVDEC decoder per
-libheif image decode while sharing the CUDA device context. It is intended to
-measure the current implementation and expose that initialization cost, not
-to claim a pooled decoder design.
+Benchmark output includes wall time, process CPU time, images/sec,
+CPU-ms/image, and average CPU cores consumed. This lets Csharp distinguish a
+throughput win from a CPU-headroom win.
+
+The current NVDEC implementation shares one CUDA device and pools
+`AVCodecContext`/NVDEC instances by HEVC parameter-set signature. This avoids
+reinitializing compatible decoders for every image while keeping incompatible
+streams isolated.
 
 The plugin accepts libheif's length-prefixed HEVC stream, converts it to
 Annex-B NAL units, decodes with FFmpeg's `hevc_cuvid`, downloads the CUDA
 NV12 frame, and returns an 8-bit YCbCr 4:2:0 `heif_image`. The current scope
 is ordinary opaque 8-bit HEVC images; unsupported formats must use the normal
 libheif path.
+
+## Next decoder experiments
+
+The current `hevc_cuvid` route is the reference GPU backend. Two experiments
+are intentionally kept separate from it so the working path remains available:
+
+- FFmpeg native HEVC decoder with CUDA/NVDEC hardware frames, avoiding the
+  legacy CUVID decoder wrapper where possible.
+- Direct NVIDIA Video Codec SDK/NVDECODE integration using a long-lived decoder
+  and decoder reconfiguration for changing still-image dimensions.
+
+Both must preserve the existing exact CPU/NVDEC YCbCr validation before they
+can replace the reference backend.
 
 ## Status
 
