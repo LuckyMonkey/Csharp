@@ -71,6 +71,7 @@ if(CSHARP_ENABLE_DIRECT_NVDEC)
     add_library(csharp-direct-nvdecode STATIC
         src/direct_nvdec.c
         src/direct_nvdec_memory.c
+        src/direct_nvdec_timing.c
     )
     target_include_directories(csharp-direct-nvdecode SYSTEM PRIVATE
         ${NVCUVID_INCLUDE_DIR}
