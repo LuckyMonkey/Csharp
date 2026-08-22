@@ -23,11 +23,19 @@ struct nvdec_decoder {
     size_t input_capacity;
     int strict;
     int pooled_codec;
+    int pooled_slot;
+};
+
+#define CSHARP_NVDEC_CODEC_POOL_SIZE 16
+
+struct pooled_codec {
+    AVCodecContext *codec;
+    uint64_t parameter_key;
+    int in_use;
 };
 
 static AVBufferRef *shared_cuda_device;
-static AVCodecContext *shared_codec;
-static int shared_codec_in_use;
+static struct pooled_codec codec_pool[CSHARP_NVDEC_CODEC_POOL_SIZE];
 static atomic_flag shared_lock = ATOMIC_FLAG_INIT;
 static unsigned long cuda_device_initializations;
 static unsigned long decoder_initializations;
@@ -100,10 +108,94 @@ static AVCodecContext *create_codec_context(AVBufferRef *device_ctx)
     return context;
 }
 
+static uint64_t parameter_set_key(const uint8_t *input, size_t input_size)
+{
+    const uint64_t offset = UINT64_C(14695981039346656037);
+    const uint64_t prime = UINT64_C(1099511628211);
+    uint64_t hash = offset;
+    size_t pos = 0;
+    unsigned int parameter_sets = 0;
+
+    while (pos + 4 <= input_size) {
+        uint32_t nal_size = ((uint32_t)input[pos] << 24) |
+                            ((uint32_t)input[pos + 1] << 16) |
+                            ((uint32_t)input[pos + 2] << 8) |
+                            (uint32_t)input[pos + 3];
+        const uint8_t *nal;
+        size_t i;
+        pos += 4;
+        if (!nal_size || nal_size > input_size - pos) break;
+        nal = input + pos;
+        if (nal_size >= 2) {
+            unsigned int nal_type = (nal[0] >> 1) & 0x3fU;
+            if (nal_type >= 32 && nal_type <= 34) {
+                for (i = 0; i < nal_size; ++i) {
+                    hash ^= nal[i];
+                    hash *= prime;
+                }
+                ++parameter_sets;
+            }
+        }
+        pos += nal_size;
+    }
+
+    if (!parameter_sets) {
+        size_t fallback_size = input_size < 1024 ? input_size : 1024;
+        for (size_t i = 0; i < fallback_size; ++i) {
+            hash ^= input[i];
+            hash *= prime;
+        }
+    }
+    return hash ^ (uint64_t)parameter_sets;
+}
+
+static int acquire_codec(struct nvdec_decoder *decoder)
+{
+    uint64_t key;
+    int free_slot = -1;
+
+    if (!decoder || !decoder->input_size) return -1;
+    key = parameter_set_key(decoder->input, decoder->input_size);
+    lock_shared_state();
+    for (int i = 0; i < CSHARP_NVDEC_CODEC_POOL_SIZE; ++i) {
+        if (codec_pool[i].codec && !codec_pool[i].in_use &&
+            codec_pool[i].parameter_key == key) {
+            codec_pool[i].in_use = 1;
+            decoder->codec = codec_pool[i].codec;
+            decoder->pooled_codec = 1;
+            decoder->pooled_slot = i;
+            avcodec_flush_buffers(decoder->codec);
+            ++decoder_reuses;
+            unlock_shared_state();
+            return 0;
+        }
+        if (!codec_pool[i].codec && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) {
+        AVCodecContext *codec = create_codec_context(decoder->device_ctx);
+        if (codec) {
+            codec_pool[free_slot].codec = codec;
+            codec_pool[free_slot].parameter_key = key;
+            codec_pool[free_slot].in_use = 1;
+            decoder->codec = codec;
+            decoder->pooled_codec = 1;
+            decoder->pooled_slot = free_slot;
+            unlock_shared_state();
+            return 0;
+        }
+    }
+    unlock_shared_state();
+
+    decoder->codec = create_codec_context(decoder->device_ctx);
+    if (!decoder->codec) return -1;
+    decoder->pooled_codec = 0;
+    decoder->pooled_slot = -1;
+    return 0;
+}
+
 static struct heif_error new_decoder(void **out_decoder)
 {
     struct nvdec_decoder *decoder = calloc(1, sizeof(*decoder));
-    AVCodecContext *codec = NULL;
 
     if (!decoder) {
         return plugin_error(heif_error_Memory_allocation_error,
@@ -131,45 +223,10 @@ static struct heif_error new_decoder(void **out_decoder)
                             heif_suberror_Unspecified, "CUDA device reference failed");
     }
 
-    if (shared_codec && !shared_codec_in_use) {
-        shared_codec_in_use = 1;
-        decoder->pooled_codec = 1;
-        codec = shared_codec;
-        avcodec_flush_buffers(codec);
-        ++decoder_reuses;
-    } else if (!shared_codec) {
-        shared_codec = create_codec_context(decoder->device_ctx);
-        if (!shared_codec) {
-            av_buffer_unref(&decoder->device_ctx);
-            unlock_shared_state();
-            free(decoder);
-            return plugin_error(heif_error_Unsupported_feature,
-                                heif_suberror_Unsupported_codec,
-                                "cannot open hevc_cuvid decoder");
-        }
-        shared_codec_in_use = 1;
-        decoder->pooled_codec = 1;
-        codec = shared_codec;
-    }
     unlock_shared_state();
-
-    if (!codec) {
-        codec = create_codec_context(decoder->device_ctx);
-        if (!codec) {
-            av_buffer_unref(&decoder->device_ctx);
-            free(decoder);
-            return plugin_error(heif_error_Unsupported_feature,
-                                heif_suberror_Unsupported_codec,
-                                "cannot open temporary hevc_cuvid decoder");
-        }
-    }
-
-    decoder->codec = codec;
+    decoder->pooled_slot = -1;
     *out_decoder = decoder;
-    if (verbose_logging) {
-        fprintf(stderr, "csharp-nvdec: %s hevc_cuvid/NVDEC context\n",
-                decoder->pooled_codec ? "acquired pooled" : "initialized temporary");
-    }
+    if (verbose_logging) fprintf(stderr, "csharp-nvdec: decoder handle created\n");
     return ok_error();
 }
 
@@ -178,10 +235,10 @@ static void free_decoder(void *raw_decoder)
     struct nvdec_decoder *decoder = raw_decoder;
     if (!decoder) return;
 
-    if (decoder->pooled_codec) {
+    if (decoder->pooled_codec && decoder->pooled_slot >= 0) {
         avcodec_flush_buffers(decoder->codec);
         lock_shared_state();
-        shared_codec_in_use = 0;
+        codec_pool[decoder->pooled_slot].in_use = 0;
         unlock_shared_state();
     } else {
         avcodec_free_context(&decoder->codec);
@@ -308,6 +365,12 @@ static struct heif_error decode_image(void *raw_decoder, struct heif_image **out
         return plugin_error(heif_error_Invalid_input, heif_suberror_End_of_data,
                             "invalid length-prefixed HEVC stream");
     }
+    if (acquire_codec(decoder) < 0) {
+        err = plugin_error(heif_error_Unsupported_feature,
+                           heif_suberror_Unsupported_codec,
+                           "cannot acquire hevc_cuvid decoder");
+        goto cleanup;
+    }
     if (annexb_size > INT_MAX) {
         err = plugin_error(heif_error_Invalid_input, heif_suberror_Invalid_parameter_value,
                            "HEVC packet is too large");
@@ -321,19 +384,16 @@ static struct heif_error decode_image(void *raw_decoder, struct heif_image **out
     }
     packet->data = annexb; packet->size = (int)annexb_size;
     ret = avcodec_send_packet(decoder->codec, packet);
+    if (ret >= 0) {
+        ret = avcodec_receive_frame(decoder->codec, decoded);
+        if (ret == AVERROR(EAGAIN)) {
+            ret = avcodec_send_packet(decoder->codec, NULL);
+            if (ret >= 0) ret = avcodec_receive_frame(decoder->codec, decoded);
+        }
+    }
     if (ret < 0) {
         err = plugin_error(heif_error_Decoder_plugin_error,
                            heif_suberror_Unspecified, "NVDEC rejected HEVC packet");
-        goto cleanup;
-    }
-    ret = avcodec_receive_frame(decoder->codec, decoded);
-    if (ret == AVERROR(EAGAIN)) {
-        ret = avcodec_send_packet(decoder->codec, NULL);
-        if (ret >= 0) ret = avcodec_receive_frame(decoder->codec, decoded);
-    }
-    if (ret < 0) {
-        err = plugin_error(heif_error_Decoder_plugin_error,
-                           heif_suberror_Unspecified, "NVDEC produced no decoded frame");
         goto cleanup;
     }
     if (decoded->format == AV_PIX_FMT_CUDA) {

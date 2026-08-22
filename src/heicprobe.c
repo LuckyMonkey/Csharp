@@ -263,9 +263,10 @@ static int run_benchmark(size_t iterations, int file_count, char **paths)
     seconds = benchmark_decodes(inputs, (size_t)file_count, iterations, true);
     if (seconds < 0.0) { fputs("NVDEC warm decode failed\n", stderr); goto cleanup; }
     print_timing("NVDEC warm", seconds, iterations);
-    printf("NVDEC initialization counts: CUDA devices=%lu AVCodecContext/NVDEC=%lu\n",
+    printf("NVDEC initialization counts: CUDA devices=%lu AVCodecContext/NVDEC=%lu reuses=%lu\n",
            csharp_nvdec_cuda_device_initializations(),
-           csharp_nvdec_decoder_initializations());
+           csharp_nvdec_decoder_initializations(),
+           csharp_nvdec_decoder_reuses());
     result = EXIT_SUCCESS;
 
 cleanup:
