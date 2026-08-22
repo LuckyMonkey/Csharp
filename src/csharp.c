@@ -222,9 +222,83 @@ static int write_metadata(struct jpeg_compress_struct *jpeg,
     return written;
 }
 
+static int encode_rgb(FILE *file, const struct heif_image *image,
+                      const struct heif_image_handle *handle, int quality)
+{
+    struct jpeg_compress_struct jpeg;
+    struct jpeg_failure failure;
+    const uint8_t *pixels;
+    uint8_t *row_buffer = NULL;
+    int stride = 0;
+    int width = heif_image_get_primary_width(image);
+    int height = heif_image_get_primary_height(image);
+    enum heif_chroma chroma = heif_image_get_chroma_format(image);
+    int channels = chroma == heif_chroma_interleaved_RGBA ? 4 : 3;
+    int result = -1;
+
+    pixels = heif_image_get_plane_readonly(image, heif_channel_interleaved, &stride);
+    if (!pixels || width <= 0 || height <= 0 || stride < width * channels ||
+        (channels != 3 && channels != 4)) {
+        fputs("csharp: decoded image has no usable RGB/RGBA plane\n", stderr);
+        return -1;
+    }
+    if (channels == 4) {
+        if ((size_t)width > SIZE_MAX / 3U) return -1;
+        row_buffer = malloc((size_t)width * 3U);
+        if (!row_buffer) return -1;
+    }
+    memset(&jpeg, 0, sizeof(jpeg));
+    memset(&failure, 0, sizeof(failure));
+    jpeg.err = jpeg_std_error(&failure.base);
+    failure.base.error_exit = jpeg_error_exit;
+    if (setjmp(failure.jump) != 0) {
+        fprintf(stderr, "csharp: JPEG encoder: %s\n", failure.message);
+        free(row_buffer);
+        jpeg_destroy_compress(&jpeg);
+        return -1;
+    }
+    jpeg_create_compress(&jpeg);
+    jpeg_stdio_dest(&jpeg, file);
+    jpeg.image_width = (JDIMENSION)width;
+    jpeg.image_height = (JDIMENSION)height;
+    jpeg.input_components = 3;
+    jpeg.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&jpeg);
+    jpeg_set_quality(&jpeg, quality, TRUE);
+    jpeg_start_compress(&jpeg, TRUE);
+    if (write_metadata(&jpeg, handle) < 0) goto done;
+    for (int row = 0; row < height; ++row) {
+        JSAMPROW scanline;
+        if (channels == 4) {
+            const uint8_t *src = pixels + (size_t)row * (size_t)stride;
+            for (int x = 0; x < width; ++x) {
+                unsigned int alpha = src[(size_t)x * 4U + 3U];
+                for (int c = 0; c < 3; ++c) {
+                    unsigned int value = src[(size_t)x * 4U + (size_t)c];
+                    row_buffer[(size_t)x * 3U + (size_t)c] =
+                        (uint8_t)((value * alpha + 255U * (255U - alpha) + 127U) / 255U);
+                }
+            }
+            scanline = row_buffer;
+        } else {
+            scanline = (JSAMPROW)(pixels + (size_t)row * (size_t)stride);
+        }
+        if (jpeg_write_scanlines(&jpeg, &scanline, 1) != 1) goto done;
+    }
+    result = 0;
+done:
+    jpeg_finish_compress(&jpeg);
+    jpeg_destroy_compress(&jpeg);
+    free(row_buffer);
+    return result;
+}
+
 static int encode_jpeg(FILE *file, const struct heif_image *image,
                        const struct heif_image_handle *handle, int quality)
 {
+    if (heif_image_get_colorspace(image) == heif_colorspace_RGB) {
+        return encode_rgb(file, image, handle, quality);
+    }
     struct jpeg_compress_struct jpeg;
     struct jpeg_failure failure;
     JSAMPROW y_rows[16];
@@ -289,41 +363,17 @@ done:
     return result;
 }
 
-static int supported_input(struct heif_context *ctx, struct heif_image_handle *handle,
-                           enum backend backend)
+static int direct_eligible(struct heif_image_handle *handle)
 {
     enum heif_colorspace colorspace = heif_colorspace_undefined;
     enum heif_chroma chroma = heif_chroma_undefined;
     int bits = heif_image_handle_get_luma_bits_per_pixel(handle);
     int chroma_bits = heif_image_handle_get_chroma_bits_per_pixel(handle);
-    if (bits != 8 || chroma_bits != 8) {
-        fprintf(stderr, "csharp: unsupported bit depth (luma=%d chroma=%d; v0.1 requires 8-bit)\n",
-                bits, chroma_bits);
-        return -1;
-    }
-    if (heif_image_handle_has_alpha_channel(handle)) {
-        fputs("csharp: unsupported primary alpha channel (JPEG v0.1 is opaque)\n", stderr);
-        return -1;
-    }
-    if (heif_context_get_number_of_top_level_images(ctx) < 1) {
-        fputs("csharp: input contains no top-level image\n", stderr);
-        return -1;
-    }
+    if (bits != 8 || chroma_bits != 8 || heif_image_handle_has_alpha_channel(handle)) return 0;
     if (heif_image_handle_get_preferred_decoding_colorspace(handle, &colorspace, &chroma).code != heif_error_Ok ||
         (colorspace != heif_colorspace_YCbCr && colorspace != heif_colorspace_undefined) ||
-        (chroma != heif_chroma_420 && chroma != heif_chroma_undefined)) {
-        fputs("csharp: unsupported source colorspace/chroma for v0.1\n", stderr);
-        return -1;
-    }
-#ifndef CSHARP_HAVE_DIRECT_NVDEC
-    if (backend == BACKEND_DIRECT) {
-        fputs("csharp: direct backend was not built; use --backend cpu or rebuild with CUDA\n", stderr);
-        return -1;
-    }
-#else
-    (void)backend;
-#endif
-    return 0;
+        (chroma != heif_chroma_420 && chroma != heif_chroma_undefined)) return 0;
+    return 1;
 }
 
 static int make_temp_path(const char *output, char *temp, size_t capacity, int *fd)
@@ -353,6 +403,8 @@ static int convert_file(const char *input, const char *output, int overwrite,
     FILE *file = NULL;
     int fd = -1;
     int result = -1;
+    int fast_path;
+    int use_direct;
 
     temp[0] = '\0';
 
@@ -366,19 +418,42 @@ static int convert_file(const char *input, const char *output, int overwrite,
     if (error.code != heif_error_Ok) { print_heif_error("read input", error); goto cleanup; }
     error = heif_context_get_primary_image_handle(ctx, &handle);
     if (error.code != heif_error_Ok) { print_heif_error("get primary image", error); goto cleanup; }
-    if (supported_input(ctx, handle, backend) != 0) goto cleanup;
+    fast_path = direct_eligible(handle);
+    use_direct = backend == BACKEND_DIRECT && fast_path;
+    if (backend == BACKEND_DIRECT && !fast_path && verbose)
+        fputs("csharp: using libheif CPU fallback for non-NVDEC HEIC features\n", stderr);
     if (backend == BACKEND_DIRECT) {
 #ifdef CSHARP_HAVE_DIRECT_NVDEC
-        error = csharp_register_direct_nvdec_plugin();
-        if (error.code != heif_error_Ok) { print_heif_error("register direct decoder", error); goto cleanup; }
+        if (use_direct) {
+            error = csharp_register_direct_nvdec_plugin();
+            if (error.code != heif_error_Ok) { print_heif_error("register direct decoder", error); goto cleanup; }
+        }
+#else
+        fputs("csharp: direct backend was not built; use --backend cpu or rebuild with CUDA\n", stderr);
+        goto cleanup;
 #endif
     }
     options = heif_decoding_options_alloc();
     if (!options) { fputs("csharp: cannot allocate decoding options\n", stderr); goto cleanup; }
+    if (use_direct) {
 #ifdef CSHARP_HAVE_DIRECT_NVDEC
-    if (backend == BACKEND_DIRECT) options->decoder_id = "csharp-direct-nvdec";
+        options->decoder_id = "csharp-direct-nvdec";
 #endif
-    error = heif_decode_image(handle, &image, heif_colorspace_YCbCr, heif_chroma_420, options);
+    }
+    error = heif_decode_image(handle, &image,
+                              fast_path ? heif_colorspace_YCbCr : heif_colorspace_RGB,
+                              fast_path ? heif_chroma_420 :
+                              (heif_image_handle_has_alpha_channel(handle) ?
+                               heif_chroma_interleaved_RGBA : heif_chroma_interleaved_RGB),
+                              options);
+    if (error.code != heif_error_Ok && use_direct) {
+        if (verbose) fputs("csharp: direct decode failed; retrying with libheif CPU decoder\n", stderr);
+        heif_image_release(image);
+        image = NULL;
+        options->decoder_id = NULL;
+        error = heif_decode_image(handle, &image, heif_colorspace_YCbCr,
+                                  heif_chroma_420, options);
+    }
     if (error.code != heif_error_Ok) { print_heif_error("decode image", error); goto cleanup; }
     if (make_temp_path(output, temp, sizeof(temp), &fd) != 0) {
         fprintf(stderr, "csharp: cannot create temporary output: %s\n", strerror(errno)); goto cleanup;

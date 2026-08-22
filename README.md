@@ -65,13 +65,16 @@ and writes through a temporary sibling before the final rename:
 ./build/csharp --backend cpu --overwrite input.heic output.jpg
 ```
 
-The direct converter supports ordinary opaque 8-bit 4:2:0 HEIC stills. It
-copies supported EXIF, XMP, and ICC data, normalizes EXIF orientation because
-libheif supplies display-oriented pixels, refuses an existing destination
-unless `--overwrite` is supplied, ignores non-primary depth/auxiliary sidecars,
-and rejects unsupported primary alpha or bit-depth inputs. Failed conversions
-remove their temporary output. Build with `-DCSHARP_ENABLE_DIRECT_NVDEC=ON`
-for the direct backend; otherwise use `--backend cpu`.
+The direct converter uses NVDEC for ordinary opaque 8-bit 4:2:0 HEIC stills
+and automatically falls back to libheif RGB/RGBA decoding for other primary
+formats, including alpha, depth/auxiliary sidecars, unusual chroma, and higher
+bit depth inputs that libheif can convert to 8-bit JPEG output. Alpha is
+composited onto white because JPEG has no alpha channel. It copies supported
+EXIF, XMP, and ICC data, normalizes EXIF orientation because libheif supplies
+display-oriented pixels, refuses an existing destination unless `--overwrite`
+is supplied, and removes temporary output after failures. Build with
+`-DCSHARP_ENABLE_DIRECT_NVDEC=ON` for the accelerated backend; otherwise use
+`--backend cpu`.
 
 The focused NVDEC proof mode decodes the same disposable image first through
 the normal libheif CPU decoder and then through the registered `csharp-nvdec`
