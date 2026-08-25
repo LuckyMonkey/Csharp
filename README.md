@@ -2,6 +2,16 @@
 
 Csharp is the HEIC/HEIF conversion dependency for [PhotoSort / PhotoSweep](https://github.com/LuckyMonkey/photosort). The repositories remain separate: Csharp creates safe JPEG derivatives; PhotoSweep performs inventory, OCR, faces, GPS, raster analysis, visual similarity, and review.
 
+## New here? Start with one file 🚀
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+./build/csharp --backend cpu input.heic output.jpg
+```
+
+The CPU backend is the portable starting point. The original HEIC is preserved, and the JPEG is written atomically. After conversion, PhotoSweep can analyze the source or derivative tree; its comparison tool is the human duplicate-review gate.
+
 ```text
 📥 HEIC/HEIF → Csharp validation/conversion → JPEG derivative
              → PhotoSweep 🔤 OCR · 🙂 faces · 📍 GPS · 🎨 swatch · 🖼️ raster
