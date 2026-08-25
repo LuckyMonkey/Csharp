@@ -1,0 +1,9 @@
+build/
+*.o
+*.so
+*.a
+*.jpg
+*.jpeg
+*.heic
+*.heif
+*.hevc

@@ -1,255 +1,155 @@
-# Csharp
+# Csharp ⚙️ HEIC/HEIF → JPEG
 
-**GPU-accelerated HEIC/HEIF decoding and conversion experiments for NVIDIA GPUs. Written in C. Not C#.**
-
-> **Project name:** “Csharp” / “see sharp.”  
-> **Implementation language:** C.  
-> **C# involvement:** none.
-
-Csharp started with a simple question: **HEIC files commonly contain HEVC-compressed image data, so why spend general-purpose CPU cycles decoding that HEVC when an NVIDIA GPU already has dedicated HEVC decode hardware?**
-
-The project now has a validated libheif decoder-plugin path that can hand real HEIC image payloads to NVIDIA NVDEC and return decoded YCbCr image planes that match the normal CPU decode exactly on the current test corpus.
-
-## 🍗 Status at a glance
-
-🍗 **Validated:** real HEIC → libheif → Csharp plugin → NVIDIA NVDEC → decoded YCbCr image.
-
-🍗 **Validated:** 8/8 current real HEIC test images produce exact CPU/NVDEC YCbCr plane hashes.
-
-🍗 **Validated:** FFmpeg native HEVC + CUDA/NVDEC backend reached **132.99 images/sec** on the current RTX 3050 benchmark corpus.
-
-🍗 **Validated:** legacy `hevc_cuvid` backend reached **37.54 images/sec** at its best measured worker count.
-
-🍗 **Baseline:** normal CPU libheif decoding on the test machine is roughly **11–14 images/sec**, depending on run/corpus mix.
-
-🍗 **Experimental:** direct NVIDIA NVDECODE integration that removes FFmpeg from the GPU decode hot path is under active development.
-
-🍗 **Planned:** keep decoded surfaces GPU-resident and feed them toward GPU JPEG encoding instead of bouncing full images through CPU memory.
-
-## 🍗 What Csharp is doing
-
-The key idea is to let **libheif keep doing HEIF container work** while Csharp replaces the expensive HEVC image decoder.
+Csharp is the HEIC/HEIF conversion dependency for [PhotoSort / PhotoSweep](https://github.com/LuckyMonkey/photosort). The repositories remain separate: Csharp creates safe JPEG derivatives; PhotoSweep performs inventory, OCR, faces, GPS, raster analysis, visual similarity, and review.
 
 ```text
-HEIC / HEIF
-    │
-    ▼
-libheif
-(container, items, metadata, transforms)
-    │
-    ▼
+📥 HEIC/HEIF → Csharp validation/conversion → JPEG derivative
+             → PhotoSweep 🔤 OCR · 🙂 faces · 📍 GPS · 🎨 swatch · 🖼️ raster
+             → human duplicate review → optional cleanup
+```
+
+Experimental GPU-accelerated HEIC/HEIF → JPEG conversion for NVIDIA GPUs.
+
+## Goal
+
+Keep HEIF container handling on the CPU, hand supported HEVC image payloads to NVIDIA NVDEC, keep decoded frames on the GPU where practical, and eventually encode JPEG with nvJPEG.
+
+```text
+HEIF container
+    ↓
+libheif / container handling
+    ↓
 HEVC coded image
-    │
-    ▼
-Csharp decoder plugin
-    │
-    ├── validated: FFmpeg native HEVC + NVDEC
-    ├── reference: hevc_cuvid + NVDEC
-    └── experimental: direct NVIDIA NVDECODE
-    │
-    ▼
-NVIDIA NVDEC
-    │
-    ▼
-decoded YUV / CUDA surface
-    │
-    ▼
-libheif image today
-GPU JPEG pipeline later
-```
-
-## 🍗 Why this exists
-
-🍗 HEIC is a HEIF container; the actual primary image is commonly compressed with HEVC.
-
-🍗 NVIDIA GPUs include dedicated fixed-function HEVC decode hardware through NVDEC.
-
-🍗 libheif exposes a decoder-plugin ABI, so Csharp does **not** need to reimplement the entire HEIF container format.
-
-🍗 Still-image workloads are different from continuous video: startup, parser, decoder lifecycle, scheduling, transfer, allocation, and synchronization overhead can dominate if each photo is treated as an isolated decode session.
-
-🍗 The project therefore treats a **persistent stream of independent HEIC decode jobs** as the unit of optimization, using pooled decoder state and parallel worker lanes.
-
-## 🍗 Current benchmark headline
-
-Current development machine:
-
-🍗 **GPU:** NVIDIA RTX 3050 6 GB (Ampere)
-
-🍗 **CPU:** Intel Core i7-3770 (Ivy Bridge, no AVX2)
-
-🍗 **OS:** Ubuntu 24.04
-
-🍗 **Driver:** NVIDIA 580.173.02
-
-🍗 **CUDA:** 13.0 environment reported during development
-
-🍗 **FFmpeg:** 6.1.1
-
-🍗 **libheif:** 1.17.6 runtime during initial bring-up
-
-Best measured decode-only results on the current small real-HEIC corpus:
-
-| Backend | Best measured throughput | Worker count | Approx. CPU use | Validation |
-| --- | ---: | ---: | ---: | --- |
-| CPU libheif | ~11–14 img/s | — | ~1 CPU core in measured runs | reference |
-| `hevc_cuvid` + NVDEC | **37.54 img/s** | 12 | ~2.95 cores | 8/8 exact hashes |
-| Native FFmpeg HEVC + NVDEC | **132.99 img/s** | 32 | ~5.64 cores | 8/8 exact hashes |
-| Direct NVDECODE | **not yet validated** | — | — | experimental |
-
-See [BENCHMARKS.md](BENCHMARKS.md) for the full measured worker sweep, stage timings, caveats, and record-to-beat.
-
-## 🍗 What changed the performance picture
-
-🍗 One-at-a-time GPU decoding was initially slower than CPU decoding because decoder/session startup dominated.
-
-🍗 Pooling reusable decoder state helped, but parallel decode lanes were the first major breakthrough.
-
-🍗 Moving from the older `hevc_cuvid` wrapper to FFmpeg's native HEVC decoder with NVIDIA hardware acceleration produced the largest jump so far.
-
-🍗 At 32 native workers, the current benchmark reached **132.99 img/s** while hardware telemetry reportedly showed decoder utilization still well below saturation.
-
-🍗 That suggests the present limit is still substantially influenced by software scheduling/feeding overhead rather than raw HEVC silicon throughput.
-
-## 🍗 Correctness before speed
-
-Csharp does not consider “it produced an image” sufficient validation.
-
-The development comparison path decodes the same HEIC through the normal CPU path and the GPU path, normalizes the result to YCbCr 4:2:0 planes, and checks the decoded bytes.
-
-Current result:
-
-🍗 **CUVID backend:** 8/8 exact YCbCr plane hash matches.
-
-🍗 **Native FFmpeg + NVDEC backend:** 8/8 exact YCbCr plane hash matches.
-
-🍗 Malformed, empty, and mislabeled input samples tested during development fail cleanly instead of being accepted as valid HEIC images.
-
-The current corpus is small and mostly ordinary opaque 8-bit HEIC. This is **not** a claim of complete HEIF compatibility.
-
-## 🍗 What is NOT production-ready yet
-
-🍗 Direct NVDECODE is still experimental and is not the validated default path.
-
-🍗 The tested corpus does not yet represent the full HEIF feature zoo.
-
-🍗 10-bit HEVC needs broader validation.
-
-🍗 HDR behavior needs explicit validation.
-
-🍗 Alpha/auxiliary image handling needs explicit validation.
-
-🍗 HEIF grids/tiles need explicit validation.
-
-🍗 Metadata/orientation/color-profile preservation needs end-to-end conversion tests.
-
-🍗 Long-duration stress, leak, sanitizer, malformed-input, and driver-stability testing still need to be expanded.
-
-🍗 A production HEIC → JPEG CLI with GPU-resident encode is still future work.
-
-## 🍗 Direct NVDECODE: next major experiment
-
-The next performance path removes FFmpeg from the hot decode path while **keeping the validated native FFmpeg backend as the reference implementation**.
-
-Target architecture:
-
-```text
-libheif
-   │
-   ▼
-Csharp direct decoder plugin
-   │
-   ▼
-CUVID parser
-   │
-   ▼
-persistent NVDECODE lanes
-   │
-   ▼
+    ↓
 NVDEC
-   │
-   ▼
-CUDA surface
-```
-
-The direct backend is being designed around:
-
-🍗 persistent parser/decoder lanes rather than one decoder per image.
-
-🍗 `cuvidReconfigureDecoder()` where compatible instead of destroy/recreate churn.
-
-🍗 producer/consumer submission and output so mapping completed frames does not unnecessarily stop new decode work.
-
-🍗 reusable/pinned host buffers where CPU output is required.
-
-🍗 eventual GPU-resident output for downstream JPEG encoding.
-
-🍗 optional intra-only optimization only after verifying that a coded HEIC image is actually safe for that mode.
-
-## 🍗 Branch layout
-
-🍗 `main` — public project landing page and stable high-level documentation. The main README may describe validated measurements produced on development branches before the implementation is merged.
-
-🍗 `phase1-heicprobe` — active decoder implementation, profiling, benchmarking, and direct-NVDECODE development.
-
-🍗 PR #1 — active development integration work; do not treat it as a stable release yet.
-
-This separation is intentional: **documentation on `main` explains what has been measured; experimental code remains isolated until it earns the merge.**
-
-## 🍗 Build status
-
-The active implementation currently lives on `phase1-heicprobe`. Build requirements and exact commands may change while direct NVDECODE is being integrated.
-
-The validated FFmpeg-backed development path uses CMake and development packages for:
-
-🍗 libheif
-
-🍗 libavcodec
-
-🍗 libavutil
-
-🍗 libswscale
-
-🍗 pthreads
-
-The direct path additionally requires compatible NVIDIA CUDA/NVDECODE development headers/libraries.
-
-Do not copy build commands from this landing page into automation without checking the active branch documentation first.
-
-## 🍗 End goal
-
-The ideal fast path is:
-
-```text
-HEIC
-  ↓
-HEIF parse
-  ↓
-HEVC payload
-  ↓
-NVDEC
-  ↓
-CUDA-resident decoded image
-  ↓
-GPU colorspace work if needed
-  ↓
-GPU JPEG encode
-  ↓
+    ↓
+GPU surface
+    ↓
+nvJPEG
+    ↓
 JPEG
 ```
 
-The point is not merely to make an old CPU tolerate HEIC. The project is testing whether dedicated media hardware can turn large HEIC ingestion/conversion workloads into a high-throughput GPU pipeline in their own right.
+Csharp has two performance goals, and they are deliberately separate:
 
-## 🍗 Name
+1. maximize images/second when GPU acceleration actually wins;
+2. provide a low-CPU decode path when preserving CPU headroom is more valuable than minimum wall time.
 
-**Csharp** means **“see sharp.”**
+A GPU path may therefore still be useful when it is slower in elapsed time if it materially reduces CPU-seconds consumed while PhotoSort or other workloads need the CPU.
 
-🍗 It is written in C.
+## Phase 1
 
-🍗 It is not written in C#.
+`heicprobe` establishes the boring, safe foundation before GPU decode work:
 
-🍗 Yes, the name is intentional.
+- open HEIC/HEIF through libheif
+- locate the primary image
+- report dimensions and basic image properties
+- report EXIF/XMP presence
+- classify whether the file is a candidate for the future GPU fast path
+- fail cleanly on malformed/unsupported input
 
-🍗 No, we do not need to discuss Microsoft's naming decisions right now.
+Complex HEIF features should eventually fall back to libheif's normal CPU decode rather than being guessed at.
 
-Anyway, about those HEIC images…
+## Build
+
+Requires CMake, a C compiler, `pkg-config`, libheif development headers, and
+FFmpeg development libraries:
+
+```bash
+sudo apt install libheif-dev libjpeg-dev libavcodec-dev libavutil-dev libswscale-dev
+```
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+./build/heicprobe image.heic
+```
+
+The v0.1 single-file converter uses libjpeg-turbo/libjpeg's raw YCbCr API
+and writes through a temporary sibling before the final rename:
+
+```bash
+./build/csharp --backend direct --quality 90 input.heic output.jpg
+./build/csharp --backend cpu --overwrite input.heic output.jpg
+```
+
+The direct converter uses NVDEC for ordinary opaque 8-bit 4:2:0 HEIC stills
+and automatically falls back to libheif RGB/RGBA decoding for other primary
+formats, including alpha, depth/auxiliary sidecars, unusual chroma, and higher
+bit depth inputs that libheif can convert to 8-bit JPEG output. Alpha is
+composited onto white because JPEG has no alpha channel. It copies supported
+EXIF, XMP, and ICC data, normalizes EXIF orientation because libheif supplies
+display-oriented pixels, refuses an existing destination unless `--overwrite`
+is supplied, and removes temporary output after failures. Build with
+`-DCSHARP_ENABLE_DIRECT_NVDEC=ON` for the accelerated backend; otherwise use
+`--backend cpu`.
+
+The focused NVDEC proof mode decodes the same disposable image first through
+the normal libheif CPU decoder and then through the registered `csharp-nvdec`
+decoder plugin:
+
+```bash
+./build/heicprobe --compare-nvdec image.heic
+```
+
+The persistent decode-only benchmark loads its inputs into memory once and
+round-robins them in one process. It reports cold startup separately from
+warm repeated decodes:
+
+```bash
+./build/heicprobe --benchmark 100 sample1.heic sample2.heic
+```
+
+Benchmark output includes wall time, process CPU time, images/sec,
+CPU-ms/image, and average CPU cores consumed. This lets Csharp distinguish a
+throughput win from a CPU-headroom win.
+
+The current NVDEC implementation shares one CUDA device and pools
+`AVCodecContext`/NVDEC instances by HEVC parameter-set signature. This avoids
+reinitializing compatible decoders for every image while keeping incompatible
+streams isolated.
+
+The plugin accepts libheif's length-prefixed HEVC stream, converts it to
+Annex-B NAL units, decodes with FFmpeg's `hevc_cuvid`, downloads the CUDA
+NV12 frame, and returns an 8-bit YCbCr 4:2:0 `heif_image`. The current scope
+is ordinary opaque 8-bit HEVC images; unsupported formats must use the normal
+libheif path.
+
+## Next decoder experiments
+
+The current `hevc_cuvid` route is the reference GPU backend. Two experiments
+are intentionally kept separate from it so the working path remains available:
+
+- FFmpeg native HEVC decoder with CUDA/NVDEC hardware frames, avoiding the
+  legacy CUVID decoder wrapper where possible.
+- Direct NVIDIA Video Codec SDK/NVDECODE integration using a long-lived decoder
+  and decoder reconfiguration for changing still-image dimensions.
+
+Both must preserve the existing exact CPU/NVDEC YCbCr validation before they
+can replace the reference backend.
+
+## Status
+
+Validated v0.1 hardening snapshot:
+
+- 48 real iCloud HEICs converted 48/48 with both CPU and direct-request modes.
+- The tested corpus observed 48 direct NVDEC paths and zero decode-failure fallbacks.
+- EXIF, standalone XMP, ICC, and orientation normalization were independently checked;
+  output JPEGs were independently decoded with ImageMagick.
+- A 1,008-conversion CPU lifecycle stress completed 1008/1008 with no invalid JPEGs,
+  temporary-file accumulation, or observed FD/RSS growth.
+- The current corpus does not cover 10-bit, HDR, alpha-primary, grid/tiled, or unusual
+  chroma inputs; those remain explicit fallback/fixture work rather than claims of coverage.
+
+Use `--report PATH` for a one-row TSV conversion result containing the selected path,
+fallback reason, dimensions, source depth/chroma, metadata counts, status, and error stage.
+Use `--no-fallback` when a direct-request test must fail instead of using CPU fallback.
+
+The direct path is suitable for continued v0.1 testing, but the project is not yet a
+drop-in archive migration tool until the missing format fixtures and longer direct-mode
+stress coverage are completed.
+
+
+## PhotoSort integration 🔗
+
+Build Csharp separately, convert only the HEIC/HEIF files that need JPEG derivatives, and point PhotoSweep at the selected source or derivative tree. Csharp preserves inputs, uses direct NVDEC only for its supported fast path, falls back to libheif CPU decoding for unsupported formats, preserves supported metadata/orientation, and atomically creates output. See the [PhotoSort integration guide](https://github.com/LuckyMonkey/photosort/blob/master/docs/integration-csharp.md).
