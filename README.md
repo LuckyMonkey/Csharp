@@ -1,7 +1,5 @@
-# Csharp ⚙️ HEIC/HEIF → JPEG
-
 ![Csharp](csharp.png)
-
+# Csharp ⚙️ HEIC/HEIF → JPEG
 Csharp is the HEIC/HEIF conversion dependency for [PhotoSort / PhotoSweep](https://github.com/LuckyMonkey/photosort). The repositories remain separate: Csharp creates safe JPEG derivatives; PhotoSweep performs inventory, OCR, faces, GPS, raster analysis, visual similarity, and review.
 
 ## New here? Start with one file 🚀
